@@ -1,0 +1,53 @@
+﻿# Build artifacts
+ctask
+ctask.exe
+*.exe
+*.test
+*.out
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Go
+coverage.out
+
+# Python / unrelated local_bridge artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Temp files
+*tmp*out.txt
+tmp-*/
+tmp-smoke*/
+ctask-smoke-*/
+codeledger-smoke-*/
+
+# Unrelated / experimental modules
+local_bridge/
+codeledger/local_bridge/
+
+# Experimental MCP, not part of mainline yet
+cmd/mcp.go
+internal/mcpserver/
+
+# CodeLedger runtime state: ignore everything under .ctask/ by default
+.ctask/*
+!.ctask/
+!.ctask/project.yaml
+!.ctask/decisions.md
+# Always ignore volatile runtime files
+.ctask/tasks.yaml
+.ctask/locks.yaml
+.ctask/events.jsonl
+.ctask/context.md
+.ctask/evidence/
+.ctask/reports/

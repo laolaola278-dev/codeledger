@@ -1,0 +1,21 @@
+.go-ci: &go-ci
+  name: ci
+  docker:
+    image: golang:1.21
+  env:
+    GOPROXY: https://goproxy.cn,direct
+  stages:
+    - name: fmt
+      script: go fmt ./...
+    - name: build
+      script: go build ./...
+    - name: vet
+      script: go vet ./...
+    - name: test
+      script: go test -count=1 ./...
+
+main:
+  push:
+    - *go-ci
+  pull_request:
+    - *go-ci
