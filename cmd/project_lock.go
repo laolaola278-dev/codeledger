@@ -3,17 +3,19 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"os"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/store"
 )
 
 // withProjectLock acquires the project-level mutation lock for the given
 // command, runs fn, and guarantees the lock is released (defer) afterwards.
 //
-// If the lock is already held by another process, a clear error is returned
-// and fn is never invoked. The error text explains who holds the lock.
-func withProjectLock(s *store.Store, command, agent, taskID string, fn func() error) error {
+// If the lock is already held by another process, a LOCK_CONFLICT typed error
+// is returned and fn is never invoked. Lock release failures are surfaced on
+// the dependency stderr stream as warnings - never via os.Exit, so deferred
+// cleanup always runs before the error reaches the process boundary.
+func withProjectLock(deps Dependencies, s *store.Store, command, agent, taskID string, fn func() error) error {
 	opts := store.ProjectLockOptions{
 		Command: command,
 		Agent:   agent,
@@ -24,18 +26,18 @@ func withProjectLock(s *store.Store, command, agent, taskID string, fn func() er
 	if err != nil {
 		var ple *store.ProjectLockError
 		if errors.As(err, &ple) {
-			// Clear, actionable message for the operator/agent.
-			return fmt.Errorf("project lock conflict: another agent is currently mutating .ctask state "+
-				"(pid %d, command %q, agent %q, task %q, expires %s). "+
-				"Wait for it to finish, or run 'ctask locks' to inspect the lock.",
-				ple.Lock.Pid, ple.Lock.Command, ple.Lock.Agent, ple.Lock.TaskID, ple.Lock.ExpiresAt)
+			// Clear, actionable message for the operator/agent, classified as
+			// a contention error so the process exits with code 3.
+			return clierr.Wrap(clierr.KindLockConflict, ple,
+				"project lock conflict: another agent is currently mutating .ctask state; "+
+					"wait for it to finish, or run 'ctask locks' to inspect the lock")
 		}
-		return err
+		return clierr.Wrap(clierr.KindOperation, err, "failed to acquire project lock")
 	}
 	defer func() {
 		if rerr := handle.Release(); rerr != nil {
 			// Lock release is best-effort; surface via stderr so it is not lost.
-			fmt.Fprintf(os.Stderr, "warning: failed to release project lock: %v\n", rerr)
+			fmt.Fprintf(deps.Stderr, "warning: failed to release project lock: %v\n", rerr)
 		}
 	}()
 

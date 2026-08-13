@@ -5,69 +5,70 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/git"
 	"github.com/codeledger/codeledger/internal/model"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var changedJSON bool
+type changedOptions struct {
+	json bool
+}
 
-var changedCmd = &cobra.Command{
-	Use:   "changed",
-	Short: "List changed files in the Git working tree",
-	Long: `List files that have been modified, added, or deleted in the Git working tree
+func newChangedCmd(deps Dependencies) *cobra.Command {
+	o := &changedOptions{}
+	cmd := newCommand("changed", "List changed files in the Git working tree",
+		`List files that have been modified, added, or deleted in the Git working tree
 (including staged and unstaged changes, and untracked files).
 
 Use --json for machine-readable output.
 
-This command requires a Git repository.`,
-	Args: cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+This command requires a Git repository.`)
+	cmd.Args = noArgs()
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
 		gitDir := filepath.Dir(s.BasePath)
 		if !git.IsGitRepo(gitDir) {
-			return fmt.Errorf("not a git repository")
+			return clierr.Wrap(clierr.KindOperation, fmt.Errorf("not a git repository"), "")
 		}
 
 		files, err := git.ChangedFiles(gitDir)
 		if err != nil {
-			return fmt.Errorf("failed to list changed files: %w", err)
+			return clierr.Wrap(clierr.KindOperation, err, "failed to list changed files")
 		}
 
-		if changedJSON {
+		stdout := cmd.OutOrStdout()
+		if o.json {
 			out, err := json.MarshalIndent(files, "", "  ")
 			if err != nil {
-				return fmt.Errorf("failed to marshal JSON: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to marshal JSON")
 			}
-			fmt.Println(string(out))
+			fmt.Fprintln(stdout, string(out))
 			return nil
 		}
 
 		if len(files) == 0 {
-			fmt.Println("No changed files.")
+			fmt.Fprintln(stdout, "No changed files.")
 			return nil
 		}
 
-		fmt.Printf("Changed files (%d):\n", len(files))
+		fmt.Fprintf(stdout, "Changed files (%d):\n", len(files))
 		for _, f := range files {
-			fmt.Println("  " + f)
+			fmt.Fprintln(stdout, "  "+f)
 		}
 
 		evt := model.NewEvent(model.EventChangedListed, "", "", fmt.Sprintf("listed %d changed files", len(files)))
 		if err := s.AppendEvent(evt); err != nil {
-			return fmt.Errorf("failed to log event: %w", err)
+			return clierr.Wrap(clierr.KindOperation, err, "failed to log event")
 		}
 
 		return nil
-	},
-}
+	}
 
-func init() {
-	changedCmd.Flags().BoolVar(&changedJSON, "json", false, "Output changed files as JSON array")
-	rootCmd.AddCommand(changedCmd)
+	cmd.Flags().BoolVar(&o.json, "json", false, "Output changed files as JSON array")
+	return cmd
 }

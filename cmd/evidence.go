@@ -5,143 +5,131 @@ import (
 	"os"
 	"strings"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var (
-	evidenceAddType    string
-	evidenceAddContent string
-	evidenceAddFile    string
-)
+type evidenceAddOptions struct {
+	typ     string
+	content string
+	file    string
+}
 
-var evidenceCmd = &cobra.Command{
-	Use:   "evidence [task-id]",
-	Short: "Manage task evidence",
-	Long: `Manage evidence recorded for a task.
+func newEvidenceCmd(deps Dependencies) *cobra.Command {
+	cmd := newCommand("evidence [task-id]", "Manage task evidence",
+		`Manage evidence recorded for a task.
 
 Without a subcommand, shows the evidence for the given task (equivalent to "show").
 
 Subcommands:
   add    Append evidence to a task's evidence file
   list   List all evidence paths for a task
-  show   Show the Markdown evidence content for a task`,
-	Args: cobra.ArbitraryArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
+  show   Show the Markdown evidence content for a task`)
+	cmd.Args = cobra.ArbitraryArgs
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return cmd.Help()
 		}
-		return showEvidence(args[0])
-	},
-}
+		return showEvidence(cmd, deps, args[0])
+	}
 
-var evidenceAddCmd = &cobra.Command{
-	Use:   "add <task-id>",
-	Short: "Add evidence to a task",
-	Long: `Append evidence to a task's evidence file (.ctask/evidence/<task-id>.md).
+	addOpts := &evidenceAddOptions{}
+	addCmd := newCommand("add <task-id>", "Add evidence to a task",
+		`Append evidence to a task's evidence file (.ctask/evidence/<task-id>.md).
 
 Provide inline content with --content, or reference a file with --file.
-Use --type to label the evidence (e.g. test, review, manual).`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+Use --type to label the evidence (e.g. test, review, manual).`)
+	addCmd.Args = exactArgs(1)
+	addCmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 		taskID := args[0]
-		content := evidenceAddContent
-		if evidenceAddFile != "" {
-			data, err := os.ReadFile(evidenceAddFile)
+		content := addOpts.content
+		if addOpts.file != "" {
+			data, err := os.ReadFile(addOpts.file)
 			if err != nil {
-				return fmt.Errorf("failed to read file: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to read file")
 			}
 			content = string(data)
 		}
 		if content == "" {
-			return fmt.Errorf("provide evidence via --content or --file")
+			return clierr.New(clierr.KindUsage, "provide evidence via --content or --file")
 		}
-		et := evidenceAddType
+		et := addOpts.typ
 		if et == "" {
 			et = "manual"
 		}
-		return withProjectLock(s, "evidence add", "", taskID, func() error {
+		return withProjectLock(deps, s, "evidence add", "", taskID, func() error {
 			if err := service.AddEvidence(s, taskID, et, content); err != nil {
-				return fmt.Errorf("evidence add failed: %w", err)
+				return classifyErr("evidence add failed", err)
 			}
-			fmt.Printf("Evidence added to task %s.\n", taskID)
+			fmt.Fprintf(cmd.OutOrStdout(), "Evidence added to task %s.\n", taskID)
 			return nil
 		})
-	},
-}
+	}
+	addCmd.Flags().StringVar(&addOpts.typ, "type", "manual", "Evidence type (e.g. test, review, manual)")
+	addCmd.Flags().StringVar(&addOpts.content, "content", "", "Inline evidence content")
+	addCmd.Flags().StringVar(&addOpts.file, "file", "", "Read evidence content from a file")
 
-var evidenceListCmd = &cobra.Command{
-	Use:   "list <task-id>",
-	Short: "List evidence paths for a task",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+	listCmd := newCommand("list <task-id>", "List evidence paths for a task", "")
+	listCmd.Args = exactArgs(1)
+	listCmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 		task, err := service.GetTaskByID(s, args[0])
 		if err != nil {
-			return err
+			return classifyErr("", err)
 		}
+		out := cmd.OutOrStdout()
 		if len(task.Evidence) == 0 {
-			fmt.Println("No evidence recorded.")
+			fmt.Fprintln(out, "No evidence recorded.")
 			return nil
 		}
-		fmt.Printf("Evidence for %s (%d):\n", task.ID, len(task.Evidence))
+		fmt.Fprintf(out, "Evidence for %s (%d):\n", task.ID, len(task.Evidence))
 		for _, e := range task.Evidence {
-			fmt.Println("  " + e)
+			fmt.Fprintln(out, "  "+e)
 		}
 		return nil
-	},
-}
+	}
 
-var evidenceShowCmd = &cobra.Command{
-	Use:   "show <task-id>",
-	Short: "Show Markdown evidence content for a task",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return showEvidence(args[0])
-	},
+	showCmd := newCommand("show <task-id>", "Show Markdown evidence content for a task", "")
+	showCmd.Args = exactArgs(1)
+	showCmd.RunE = func(cmd *cobra.Command, args []string) error {
+		return showEvidence(cmd, deps, args[0])
+	}
+
+	cmd.AddCommand(addCmd, listCmd, showCmd)
+	return cmd
 }
 
 // showEvidence reads and displays the .md evidence file for a task.
-func showEvidence(taskID string) error {
-	s := store.NewStore(".")
-	if err := s.RequireInit(); err != nil {
+func showEvidence(cmd *cobra.Command, deps Dependencies, taskID string) error {
+	s := newStore(deps)
+	if err := requireInit(s); err != nil {
 		return err
 	}
 	// Verify the task exists
 	if _, err := service.GetTaskByID(s, taskID); err != nil {
-		return err
+		return classifyErr("", err)
 	}
+	out := cmd.OutOrStdout()
 	evidencePath := s.EvidencePath(taskID)
 	data, err := os.ReadFile(evidencePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("no evidence file found for task %s", taskID)
+			return clierr.New(clierr.KindNotFound, "no evidence file found for task %s", taskID)
 		}
-		return fmt.Errorf("failed to read evidence: %w", err)
+		return clierr.Wrap(clierr.KindOperation, err, "failed to read evidence")
 	}
 	if len(strings.TrimSpace(string(data))) == 0 {
-		fmt.Println("Evidence file is empty.")
+		fmt.Fprintln(out, "Evidence file is empty.")
 		return nil
 	}
-	fmt.Print(string(data))
+	fmt.Fprint(out, string(data))
 	return nil
-}
-
-func init() {
-	evidenceAddCmd.Flags().StringVar(&evidenceAddType, "type", "manual", "Evidence type (e.g. test, review, manual)")
-	evidenceAddCmd.Flags().StringVar(&evidenceAddContent, "content", "", "Inline evidence content")
-	evidenceAddCmd.Flags().StringVar(&evidenceAddFile, "file", "", "Read evidence content from a file")
-
-	evidenceCmd.AddCommand(evidenceAddCmd)
-	evidenceCmd.AddCommand(evidenceListCmd)
-	evidenceCmd.AddCommand(evidenceShowCmd)
-	rootCmd.AddCommand(evidenceCmd)
 }

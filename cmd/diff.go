@@ -4,101 +4,99 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/git"
 	"github.com/codeledger/codeledger/internal/model"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var (
-	diffStat     bool
-	diffNameOnly bool
-	diffCached   bool
-	diffJSON     bool
-)
+type diffOptions struct {
+	stat     bool
+	nameOnly bool
+	cached   bool
+}
 
-var diffCmd = &cobra.Command{
-	Use:   "diff",
-	Short: "Show Git diff for the working tree",
-	Long: `Show the Git diff for the working tree.
+func newDiffCmd(deps Dependencies) *cobra.Command {
+	o := &diffOptions{}
+	cmd := newCommand("diff", "Show Git diff for the working tree",
+		`Show the Git diff for the working tree.
 
 By default, shows the full working-tree diff (unstaged changes).
 Use --cached to show only staged changes.
 Use --stat for a diffstat summary.
 Use --name-only for just the file names.
 
-This command requires a Git repository.`,
-	Args: cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+This command requires a Git repository.`)
+	cmd.Args = noArgs()
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
 		gitDir := filepath.Dir(s.BasePath)
 		if !git.IsGitRepo(gitDir) {
-			return fmt.Errorf("not a git repository")
+			return clierr.Wrap(clierr.KindOperation, fmt.Errorf("not a git repository"), "")
 		}
 
+		stdout := cmd.OutOrStdout()
 		switch {
-		case diffStat:
+		case o.stat:
 			out, err := git.DiffStat(gitDir)
 			if err != nil {
-				return fmt.Errorf("failed to get diffstat: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to get diffstat")
 			}
 			if out == "" {
-				fmt.Println("No diff.")
+				fmt.Fprintln(stdout, "No diff.")
 				return nil
 			}
-			fmt.Print(out)
+			fmt.Fprint(stdout, out)
 			if len(out) > 0 && out[len(out)-1] != '\n' {
-				fmt.Println()
+				fmt.Fprintln(stdout)
 			}
-		case diffNameOnly:
-			files, err := git.DiffNameOnly(gitDir, diffCached)
+		case o.nameOnly:
+			files, err := git.DiffNameOnly(gitDir, o.cached)
 			if err != nil {
-				return fmt.Errorf("failed to get diff file names: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to get diff file names")
 			}
 			if len(files) == 0 {
-				fmt.Println("No diff.")
+				fmt.Fprintln(stdout, "No diff.")
 				return nil
 			}
 			for _, f := range files {
-				fmt.Println(f)
+				fmt.Fprintln(stdout, f)
 			}
 		default:
 			var out string
 			var err error
-			if diffCached {
+			if o.cached {
 				out, err = git.Diff(gitDir, true)
 			} else {
 				out, err = git.FullDiff(gitDir)
 			}
 			if err != nil {
-				return fmt.Errorf("failed to get diff: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to get diff")
 			}
 			if out == "" {
-				fmt.Println("No diff.")
+				fmt.Fprintln(stdout, "No diff.")
 				return nil
 			}
-			fmt.Print(out)
+			fmt.Fprint(stdout, out)
 			if len(out) > 0 && out[len(out)-1] != '\n' {
-				fmt.Println()
+				fmt.Fprintln(stdout)
 			}
 		}
 
 		evt := model.NewEvent(model.EventDiffListed, "", "", "diff listed")
 		if err := s.AppendEvent(evt); err != nil {
-			return fmt.Errorf("failed to log event: %w", err)
+			return clierr.Wrap(clierr.KindOperation, err, "failed to log event")
 		}
 
 		return nil
-	},
-}
+	}
 
-func init() {
-	diffCmd.Flags().BoolVar(&diffStat, "stat", false, "Show diffstat summary")
-	diffCmd.Flags().BoolVar(&diffNameOnly, "name-only", false, "Show only file names")
-	diffCmd.Flags().BoolVar(&diffCached, "cached", false, "Show staged (cached) diff only")
-	rootCmd.AddCommand(diffCmd)
+	cmd.Flags().BoolVar(&o.stat, "stat", false, "Show diffstat summary")
+	cmd.Flags().BoolVar(&o.nameOnly, "name-only", false, "Show only file names")
+	cmd.Flags().BoolVar(&o.cached, "cached", false, "Show staged (cached) diff only")
+	return cmd
 }

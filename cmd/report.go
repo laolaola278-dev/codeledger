@@ -4,29 +4,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/codeledger/codeledger/internal/reportgen"
-	"github.com/codeledger/codeledger/internal/store"
-	"github.com/spf13/cobra"
 	"time"
+
+	"github.com/codeledger/codeledger/internal/clierr"
+	"github.com/codeledger/codeledger/internal/reportgen"
+	"github.com/spf13/cobra"
 )
 
-var reportCmd = &cobra.Command{
-	Use:   "report",
-	Short: "Generate a progress report",
-	Long: `Generate a Markdown progress report and save it to .ctask/reports/.
+func newReportCmd(deps Dependencies) *cobra.Command {
+	cmd := newCommand("report", "Generate a progress report",
+		`Generate a Markdown progress report and save it to .ctask/reports/.
 
 The report includes project overview, completed tasks, in-progress tasks,
-blocked tasks, modified files, test results, risks, and next steps.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+blocked tasks, modified files, test results, risks, and next steps.`)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
 		report, err := reportgen.GenerateReport(s)
 		if err != nil {
-			return fmt.Errorf("report generation failed: %w", err)
+			return clierr.Wrap(clierr.KindOperation, err, "report generation failed")
 		}
 
 		// Save to reports/YYYY-MM-DD-report.md
@@ -34,18 +33,15 @@ blocked tasks, modified files, test results, risks, and next steps.`,
 		reportPath := filepath.Join(s.ReportsDirPath(), date+"-report.md")
 
 		if err := os.MkdirAll(s.ReportsDirPath(), 0755); err != nil {
-			return fmt.Errorf("failed to create reports directory: %w", err)
+			return clierr.Wrap(clierr.KindOperation, err, "failed to create reports directory")
 		}
 
 		if err := os.WriteFile(reportPath, []byte(report), 0644); err != nil {
-			return fmt.Errorf("failed to write report: %w", err)
+			return clierr.Wrap(clierr.KindOperation, err, "failed to write report")
 		}
 
-		fmt.Printf("Report saved to: %s\n", reportPath)
+		fmt.Fprintf(cmd.OutOrStdout(), "Report saved to: %s\n", reportPath)
 		return nil
-	},
-}
-
-func init() {
-	rootCmd.AddCommand(reportCmd)
+	}
+	return cmd
 }

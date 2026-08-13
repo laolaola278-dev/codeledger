@@ -5,69 +5,68 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var (
-	nextRole string
-	nextJSON bool
-)
+type nextOptions struct {
+	role string
+	json bool
+}
 
-var nextCmd = &cobra.Command{
-	Use:   "next",
-	Short: "Show the next available task to work on",
-	Long: `Find the next available task based on priority and dependencies.
+func newNextCmd(deps Dependencies) *cobra.Command {
+	o := &nextOptions{}
+	cmd := newCommand("next", "Show the next available task to work on",
+		`Find the next available task based on priority and dependencies.
 
 Only tasks that are pending, have all dependencies completed, and are not
 actively locked by another agent will be shown.
 
 Flags:
   --role     Filter by role (optional, for future use)
-  --json     Output in JSON format`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+  --json     Output in JSON format`)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
-		result, err := service.NextTask(s, nextRole)
+		result, err := service.NextTask(s, o.role)
 		if err != nil {
-			return fmt.Errorf("next failed: %w", err)
+			return classifyErr("next failed", err)
 		}
 
-		if nextJSON {
+		out := cmd.OutOrStdout()
+		if o.json {
 			data, err := json.MarshalIndent(result, "", "  ")
 			if err != nil {
-				return fmt.Errorf("failed to marshal JSON: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to marshal JSON")
 			}
-			fmt.Println(string(data))
+			fmt.Fprintln(out, string(data))
 			return nil
 		}
 
 		if !result.Available {
-			fmt.Println(result.Message)
+			fmt.Fprintln(out, result.Message)
 			return nil
 		}
 
 		t := result.Task
-		fmt.Println("Next task:")
-		fmt.Printf("  %s %s\n", t.ID, t.Title)
-		fmt.Printf("  Priority: %s\n", t.Priority)
+		fmt.Fprintln(out, "Next task:")
+		fmt.Fprintf(out, "  %s %s\n", t.ID, t.Title)
+		fmt.Fprintf(out, "  Priority: %s\n", t.Priority)
 		if len(t.DependsOn) > 0 {
-			fmt.Printf("  Depends on: %s\n", strings.Join(t.DependsOn, ", "))
+			fmt.Fprintf(out, "  Depends on: %s\n", strings.Join(t.DependsOn, ", "))
 		}
 		if t.Description != "" {
-			fmt.Printf("  Description: %s\n", t.Description)
+			fmt.Fprintf(out, "  Description: %s\n", t.Description)
 		}
 
 		return nil
-	},
-}
+	}
 
-func init() {
-	nextCmd.Flags().StringVar(&nextRole, "role", "", "Filter by role (optional)")
-	nextCmd.Flags().BoolVar(&nextJSON, "json", false, "Output in JSON format")
-	rootCmd.AddCommand(nextCmd)
+	cmd.Flags().StringVar(&o.role, "role", "", "Filter by role (optional)")
+	cmd.Flags().BoolVar(&o.json, "json", false, "Output in JSON format")
+	return cmd
 }

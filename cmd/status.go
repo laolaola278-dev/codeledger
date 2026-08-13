@@ -5,70 +5,66 @@ import (
 	"strings"
 
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Show project status overview",
-	Long: `Display a summary of the project's current status:
+func newStatusCmd(deps Dependencies) *cobra.Command {
+	cmd := newCommand("status", "Show project status overview",
+		`Display a summary of the project's current status:
   - Total / pending / in_progress / done / blocked task counts
   - Current in-progress task
   - Blocked tasks with reasons
-  - Next suggested task to work on`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+  - Next suggested task to work on`)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
 		status, err := service.GetStatus(s)
 		if err != nil {
-			return fmt.Errorf("status failed: %w", err)
+			return classifyErr("status failed", err)
 		}
 
-		fmt.Printf("Project: %s\n\n", status.ProjectName)
-		fmt.Println("Progress:")
-		fmt.Printf("  Done:       %d\n", status.Done)
-		fmt.Printf("  In Progress: %d\n", status.InProgress)
-		fmt.Printf("  Pending:    %d\n", status.Pending)
-		fmt.Printf("  Blocked:    %d\n", status.Blocked)
-		fmt.Println()
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "Project: %s\n\n", status.ProjectName)
+		fmt.Fprintln(out, "Progress:")
+		fmt.Fprintf(out, "  Done:       %d\n", status.Done)
+		fmt.Fprintf(out, "  In Progress: %d\n", status.InProgress)
+		fmt.Fprintf(out, "  Pending:    %d\n", status.Pending)
+		fmt.Fprintf(out, "  Blocked:    %d\n", status.Blocked)
+		fmt.Fprintln(out)
 
 		if status.CurrentTask != nil {
-			fmt.Println("Current Task:")
-			fmt.Printf("  %s: %s\n", status.CurrentTask.ID, status.CurrentTask.Title)
-			fmt.Println()
+			fmt.Fprintln(out, "Current Task:")
+			fmt.Fprintf(out, "  %s: %s\n", status.CurrentTask.ID, status.CurrentTask.Title)
+			fmt.Fprintln(out)
 		}
 
 		if len(status.BlockedTasks) > 0 {
-			fmt.Println("Blocked Tasks:")
+			fmt.Fprintln(out, "Blocked Tasks:")
 			for _, t := range status.BlockedTasks {
-				fmt.Printf("  %s: %s\n", t.ID, t.Title)
+				fmt.Fprintf(out, "  %s: %s\n", t.ID, t.Title)
 				if t.BlockedReason != "" {
-					fmt.Printf("    Reason: %s\n", t.BlockedReason)
+					fmt.Fprintf(out, "    Reason: %s\n", t.BlockedReason)
 				}
 			}
-			fmt.Println()
+			fmt.Fprintln(out)
 		}
 
 		if status.NextTask != nil {
-			fmt.Println("Next Suggested:")
-			fmt.Printf("  %s: %s\n", status.NextTask.ID, status.NextTask.Title)
+			fmt.Fprintln(out, "Next Suggested:")
+			fmt.Fprintf(out, "  %s: %s\n", status.NextTask.ID, status.NextTask.Title)
 			if len(status.NextTask.DependsOn) > 0 {
-				fmt.Printf("  Depends on: %s\n", strings.Join(status.NextTask.DependsOn, ", "))
+				fmt.Fprintf(out, "  Depends on: %s\n", strings.Join(status.NextTask.DependsOn, ", "))
 			}
 		} else if status.Pending > 0 {
-			fmt.Println("All pending tasks have unmet dependencies.")
+			fmt.Fprintln(out, "All pending tasks have unmet dependencies.")
 		} else if status.Pending == 0 && status.InProgress == 0 && status.Blocked == 0 {
-			fmt.Println("All tasks are complete.")
+			fmt.Fprintln(out, "All tasks are complete.")
 		}
 
 		return nil
-	},
-}
-
-func init() {
-	rootCmd.AddCommand(statusCmd)
+	}
+	return cmd
 }

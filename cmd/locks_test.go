@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +17,10 @@ import (
 
 // TestCmd_Locks_NoActiveLocks verifies `ctask locks` reports no locks.
 func TestCmd_Locks_NoActiveLocks(t *testing.T) {
-	initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
-	out, err := runRootArgs(t, "locks")
+	out, err := env.run("locks")
 	if err != nil {
 		t.Fatalf("locks failed: %v", err)
 	}
@@ -28,16 +31,17 @@ func TestCmd_Locks_NoActiveLocks(t *testing.T) {
 
 // TestCmd_Locks_ShowsTaskLocks verifies `ctask locks` lists task locks.
 func TestCmd_Locks_ShowsTaskLocks(t *testing.T) {
-	initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
-	if _, err := runRootArgs(t, "add", "Task A"); err != nil {
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
-	if _, err := runRootArgs(t, "claim", "TASK-001", "--agent", "codex", "--ttl", "30m"); err != nil {
+	if _, err := env.run("claim", "TASK-001", "--agent", "codex", "--ttl", "30m"); err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
 
-	out, err := runRootArgs(t, "locks")
+	out, err := env.run("locks")
 	if err != nil {
 		t.Fatalf("locks failed: %v", err)
 	}
@@ -55,17 +59,18 @@ func TestCmd_Locks_ShowsTaskLocks(t *testing.T) {
 // TestCmd_Locks_ShowsProjectLock verifies `ctask locks` displays the
 // project-level mutation lock while it is held.
 func TestCmd_Locks_ShowsProjectLock(t *testing.T) {
-	dir := initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
 	// Acquire the project lock directly, then inspect via `ctask locks`.
-	s := store.NewStore(".")
+	s := env.store()
 	handle, err := store.AcquireProjectLock(s, store.ProjectLockOptions{Command: "add", TTL: 5 * time.Minute})
 	if err != nil {
 		t.Fatalf("AcquireProjectLock failed: %v", err)
 	}
 	defer handle.Release()
 
-	out, err := runRootArgs(t, "locks")
+	out, err := env.run("locks")
 	if err != nil {
 		t.Fatalf("locks failed: %v", err)
 	}
@@ -78,14 +83,14 @@ func TestCmd_Locks_ShowsProjectLock(t *testing.T) {
 	if !contains(out, "Expires:") {
 		t.Errorf("expected expiry info in project lock output, got: %q", out)
 	}
-	_ = dir
 }
 
 // TestCmd_Locks_JSON verifies the JSON output structure of `ctask locks --json`.
 func TestCmd_Locks_JSON(t *testing.T) {
-	initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
-	out, err := runRootArgs(t, "locks", "--json")
+	out, err := env.run("locks", "--json")
 	if err != nil {
 		t.Fatalf("locks --json failed: %v", err)
 	}
@@ -101,17 +106,18 @@ func TestCmd_Locks_JSON(t *testing.T) {
 // TestCmd_MutationCommandBlockedByProjectLock verifies that a mutating
 // command fails with a clear conflict error when the project lock is held.
 func TestCmd_MutationCommandBlockedByProjectLock(t *testing.T) {
-	initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
 	// Hold the project lock manually.
-	s := store.NewStore(".")
+	s := env.store()
 	handle, err := store.AcquireProjectLock(s, store.ProjectLockOptions{Command: "other-agent", TTL: 5 * time.Minute})
 	if err != nil {
 		t.Fatalf("AcquireProjectLock failed: %v", err)
 	}
 	defer handle.Release()
 
-	out, err := runRootArgs(t, "add", "Task A")
+	out, err := env.run("add", "Task A")
 	if err == nil {
 		t.Fatal("expected add to fail while project lock is held")
 	}
@@ -127,11 +133,14 @@ func TestCmd_MutationCommandBlockedByProjectLock(t *testing.T) {
 // TestCmd_ConcurrentClaimOnlyOneSucceeds spawns many goroutines that all
 // invoke the claim command against the same initialized project. Exactly one
 // must win the task lock; the rest must fail with the claim-already-locked
-// error, and the project lock must never be left behind.
+// error, and the project lock must never be left behind. Each goroutine uses
+// its own command tree, writers, and buffers - only the project directory is
+// shared, so no package-level state is ever touched concurrently.
 func TestCmd_ConcurrentClaimOnlyOneSucceeds(t *testing.T) {
-	dir := initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
-	if _, err := runRootArgs(t, "add", "Task A"); err != nil {
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
 
@@ -144,8 +153,15 @@ func TestCmd_ConcurrentClaimOnlyOneSucceeds(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out, err := runRootArgs(t, "claim", "TASK-001", "--agent", "agent-"+string(rune('a'+i)), "--ttl", "30m")
-			_ = out
+			deps := Dependencies{
+				Stdin:   strings.NewReader(""),
+				Stdout:  &bytes.Buffer{},
+				Stderr:  &bytes.Buffer{},
+				WorkDir: env.Dir,
+			}
+			root := NewRoot(deps)
+			root.SetArgs([]string{"claim", "TASK-001", "--agent", fmt.Sprintf("agent-%d", i), "--ttl", "30m"})
+			err := root.Execute()
 			if err == nil {
 				mu.Lock()
 				successes++
@@ -160,7 +176,7 @@ func TestCmd_ConcurrentClaimOnlyOneSucceeds(t *testing.T) {
 	}
 
 	// The project lock must not be left behind after all claims completed.
-	if _, err := os.Stat(filepath.Join(dir, ".ctask", store.ProjectLockFile)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(env.Dir, ".ctask", store.ProjectLockFile)); !os.IsNotExist(err) {
 		t.Errorf("project lock file left behind: %v", err)
 	}
 }
@@ -168,13 +184,14 @@ func TestCmd_ConcurrentClaimOnlyOneSucceeds(t *testing.T) {
 // TestCmd_Locks_DoesNotAcquireProjectLock verifies the read-only locks
 // command never creates a project lock file.
 func TestCmd_Locks_DoesNotAcquireProjectLock(t *testing.T) {
-	initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
-	if _, err := runRootArgs(t, "locks"); err != nil {
+	if _, err := env.run("locks"); err != nil {
 		t.Fatalf("locks failed: %v", err)
 	}
 
-	s := store.NewStore(".")
+	s := env.store()
 	if _, err := os.Stat(s.ProjectLockPath()); !os.IsNotExist(err) {
 		t.Errorf("locks command must not create a project lock, found: %v", err)
 	}
@@ -183,13 +200,14 @@ func TestCmd_Locks_DoesNotAcquireProjectLock(t *testing.T) {
 // TestProjectLockEventsRecorded verifies mutating commands record the
 // project.lock_acquired and project.lock_released events.
 func TestProjectLockEventsRecorded(t *testing.T) {
-	initTempProject(t)
+	env := newTestEnv(t)
+	env.initProject()
 
-	if _, err := runRootArgs(t, "add", "Task A"); err != nil {
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
 
-	s := store.NewStore(".")
+	s := env.store()
 	events, err := s.ReadEvents()
 	if err != nil {
 		t.Fatalf("ReadEvents failed: %v", err)

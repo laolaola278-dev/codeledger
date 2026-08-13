@@ -1,53 +1,55 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/codeledger/codeledger/internal/util"
 	"github.com/spf13/cobra"
 )
 
-var (
-	addDescription string
-	addPriority    string
-	addDepends     string
-)
+type addOptions struct {
+	description string
+	priority    string
+	depends     string
+}
 
-var addCmd = &cobra.Command{
-	Use:   "add <title>",
-	Short: "Add a new task",
-	Long: `Add a new task to the project. The task will be assigned a unique ID like TASK-001.
+func newAddCmd(deps Dependencies) *cobra.Command {
+	o := &addOptions{}
+	cmd := newCommand("add <title>", "Add a new task",
+		`Add a new task to the project. The task will be assigned a unique ID like TASK-001.
 
 Flags:
   --description   Task description
   --priority      Priority: low, medium (default), high
-  --depends       Comma-separated list of task IDs this task depends on`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+  --depends       Comma-separated list of task IDs this task depends on`)
+	cmd.Args = exactArgs(1)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
 		title := args[0]
-		depends := util.SplitCommas(addDepends)
+		depends := util.SplitCommas(o.depends)
 
-		return withProjectLock(s, "add", "", "", func() error {
-			task, err := service.AddTask(s, title, addDescription, addPriority, depends)
+		return withProjectLock(deps, s, "add", "", "", func() error {
+			task, err := service.AddTask(s, title, o.description, o.priority, depends)
 			if err != nil {
-				return fmt.Errorf("add failed: %w", err)
+				if errors.Is(err, service.ErrInvalidPriority) {
+					return clierr.Wrap(clierr.KindValidation, err, "add failed")
+				}
+				return classifyErr("add failed", err)
 			}
-			fmt.Printf("Added task %s: %s\n", task.ID, task.Title)
+			fmt.Fprintf(cmd.OutOrStdout(), "Added task %s: %s\n", task.ID, task.Title)
 			return nil
 		})
-	},
-}
+	}
 
-func init() {
-	addCmd.Flags().StringVar(&addDescription, "description", "", "Task description")
-	addCmd.Flags().StringVar(&addPriority, "priority", "medium", "Priority: low, medium, high")
-	addCmd.Flags().StringVar(&addDepends, "depends", "", "Comma-separated dependency task IDs")
-	rootCmd.AddCommand(addCmd)
+	cmd.Flags().StringVar(&o.description, "description", "", "Task description")
+	cmd.Flags().StringVar(&o.priority, "priority", "medium", "Priority: low, medium, high")
+	cmd.Flags().StringVar(&o.depends, "depends", "", "Comma-separated dependency task IDs")
+	return cmd
 }

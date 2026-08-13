@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var locksJSON bool
+type locksOptions struct {
+	json bool
+}
 
 // locksCmdOutput is the JSON structure for `ctask locks --json`.
 //
@@ -46,10 +49,10 @@ type projectLockSummary struct {
 	Expired   bool   `json:"expired,omitempty"`
 }
 
-var locksCmd = &cobra.Command{
-	Use:   "locks",
-	Short: "Show current task locks and project mutation lock",
-	Long: `Display the current lock state of the project:
+func newLocksCmd(deps Dependencies) *cobra.Command {
+	o := &locksOptions{}
+	cmd := newCommand("locks", "Show current task locks and project mutation lock",
+		`Display the current lock state of the project:
 
   - Task locks from .ctask/locks.yaml (claimed tasks)
   - The project-level mutation lock from .ctask/.ctask.lock (if held)
@@ -61,11 +64,11 @@ Use --json for machine-readable output.
 NOTE: this is a READ-ONLY snapshot command. It does NOT acquire the
 project mutation lock and never modifies .ctask state, so it is always
 safe to run even while another agent is mid-mutation. The output is a
-point-in-time view and may change immediately afterwards.`,
-	Args: cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+point-in-time view and may change immediately afterwards.`)
+	cmd.Args = noArgs()
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
@@ -95,7 +98,7 @@ point-in-time view and may change immediately afterwards.`,
 		// Project mutation lock from .ctask/.ctask.lock.
 		pl, perr := store.ReadProjectLock(s)
 		if perr != nil {
-			return fmt.Errorf("failed to read project lock: %w", perr)
+			return clierr.Wrap(clierr.KindOperation, perr, "failed to read project lock")
 		}
 		if pl != nil {
 			out.ProjectLock = &projectLockSummary{
@@ -109,55 +112,59 @@ point-in-time view and may change immediately afterwards.`,
 			}
 		}
 
-		if locksJSON {
+		stdout := cmd.OutOrStdout()
+		if o.json {
 			if out.ProjectLock == nil && len(out.TaskLocks) == 0 {
 				out.NoActiveLocks = true
 			}
 			data, err := json.MarshalIndent(out, "", "  ")
 			if err != nil {
-				return fmt.Errorf("failed to marshal JSON: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to marshal JSON")
 			}
-			fmt.Println(string(data))
+			fmt.Fprintln(stdout, string(data))
 			return nil
 		}
 
 		if out.ProjectLock == nil && len(out.TaskLocks) == 0 {
-			fmt.Println("No active locks.")
+			fmt.Fprintln(stdout, "No active locks.")
 			return nil
 		}
 
 		if out.ProjectLock != nil {
 			pl := out.ProjectLock
-			fmt.Println("Project mutation lock:")
-			fmt.Printf("  Pid:       %d\n", pl.Pid)
-			fmt.Printf("  Command:   %s\n", pl.Command)
+			fmt.Fprintln(stdout, "Project mutation lock:")
+			fmt.Fprintf(stdout, "  Pid:       %d\n", pl.Pid)
+			fmt.Fprintf(stdout, "  Command:   %s\n", pl.Command)
 			if pl.Agent != "" {
-				fmt.Printf("  Agent:     %s\n", pl.Agent)
+				fmt.Fprintf(stdout, "  Agent:     %s\n", pl.Agent)
 			}
 			if pl.TaskID != "" {
-				fmt.Printf("  Task:      %s\n", pl.TaskID)
+				fmt.Fprintf(stdout, "  Task:      %s\n", pl.TaskID)
 			}
-			fmt.Printf("  Created:   %s\n", pl.CreatedAt)
-			fmt.Printf("  Expires:   %s\n", pl.ExpiresAt)
+			fmt.Fprintf(stdout, "  Created:   %s\n", pl.CreatedAt)
+			fmt.Fprintf(stdout, "  Expires:   %s\n", pl.ExpiresAt)
 			if pl.Expired {
-				fmt.Println("  Status:    EXPIRED (stale, will be reclaimed on next mutation)")
+				fmt.Fprintln(stdout, "  Status:    EXPIRED (stale, will be reclaimed on next mutation)")
 			}
-			fmt.Println()
+			fmt.Fprintln(stdout)
 		}
 
 		if len(out.TaskLocks) > 0 {
-			fmt.Printf("Task locks (%d):\n", len(out.TaskLocks))
+			fmt.Fprintf(stdout, "Task locks (%d):\n", len(out.TaskLocks))
 			for _, l := range out.TaskLocks {
 				status := "active"
 				if l.Expired {
 					status = "expired"
 				}
-				fmt.Printf("  %s  %s  agent=%s  expires=%s  [%s]\n", l.TaskID, l.Agent, l.Role, l.ExpiresAt, status)
+				fmt.Fprintf(stdout, "  %s  %s  agent=%s  expires=%s  [%s]\n", l.TaskID, l.Agent, l.Role, l.ExpiresAt, status)
 			}
 		}
 
 		return nil
-	},
+	}
+
+	cmd.Flags().BoolVar(&o.json, "json", false, "Output locks as JSON")
+	return cmd
 }
 
 // isProjectLockExpired reports whether a project lock timestamp is stale.
@@ -171,9 +178,4 @@ func isProjectLockExpired(expiresAt string) bool {
 		return true
 	}
 	return time.Now().UTC().After(t)
-}
-
-func init() {
-	locksCmd.Flags().BoolVar(&locksJSON, "json", false, "Output locks as JSON")
-	rootCmd.AddCommand(locksCmd)
 }

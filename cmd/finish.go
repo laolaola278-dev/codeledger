@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/contextgen"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/reportgen"
@@ -15,20 +16,20 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	finishTask        string
-	finishFiles       string
-	finishTest        string
-	finishResult      string
-	finishNote        string
-	finishAgent       string
-	finishAutoFiles   bool
-	finishCaptureDiff bool
-	finishSkipReport  bool
-	finishSkipContext bool
-	finishStrict      bool
-	finishJSON        bool
-)
+type finishOptions struct {
+	task        string
+	files       string
+	test        string
+	result      string
+	note        string
+	agent       string
+	autoFiles   bool
+	captureDiff bool
+	skipReport  bool
+	skipContext bool
+	strict      bool
+	json        bool
+}
 
 // finishJSONOutput is the JSON structure for --json output.
 type finishJSONOutput struct {
@@ -40,10 +41,10 @@ type finishJSONOutput struct {
 	Errors         []string             `json:"errors,omitempty"`
 }
 
-var finishCmd = &cobra.Command{
-	Use:   "finish",
-	Short: "End an agent session: check, complete task, generate context and report",
-	Long: `Run a session finish sequence.
+func newFinishCmd(deps Dependencies) *cobra.Command {
+	o := &finishOptions{}
+	cmd := newCommand("finish", "End an agent session: check, complete task, generate context and report",
+		`Run a session finish sequence.
 
 Steps:
   1. Run consistency check (ctask check)
@@ -70,253 +71,253 @@ Flags:
   --skip-context      Do not regenerate context.md
   --skip-report       Do not generate a report file
   --strict            Treat check warnings as failures (exit code 1)
-  --json              Output results as JSON`,
-	Args: cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+  --json              Output results as JSON`)
+	cmd.Args = noArgs()
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
-		exitNonZero := false
-		err := withProjectLock(s, "finish", finishAgent, finishTask, func() error {
-			return runFinish(s, &exitNonZero)
+		// The project lock is released (deferred) before this function's
+		// error is acted upon, so a strict-mode failure propagates as a
+		// typed error instead of os.Exit.
+		return withProjectLock(deps, s, "finish", o.agent, o.task, func() error {
+			return runFinish(cmd, s, o)
 		})
-		if exitNonZero {
-			os.Exit(1)
-		}
-		return err
-	},
+	}
+
+	cmd.Flags().StringVar(&o.task, "task", "", "Task ID to complete before finishing")
+	cmd.Flags().StringVar(&o.agent, "agent", "", "Agent name performing the finish")
+	cmd.Flags().StringVar(&o.files, "files", "", "Comma-separated modified files (with --task)")
+	cmd.Flags().StringVar(&o.test, "test", "", "Test command that was run (with --task)")
+	cmd.Flags().StringVar(&o.result, "result", "", "Test result: passed, failed, skipped, unknown (with --task)")
+	cmd.Flags().StringVar(&o.note, "note", "", "Completion note (with --task)")
+	cmd.Flags().BoolVar(&o.autoFiles, "auto-files", false, "Auto-detect changed files from Git (with --task)")
+	cmd.Flags().BoolVar(&o.captureDiff, "capture-diff", false, "Capture full Git diff (with --task)")
+	cmd.Flags().BoolVar(&o.skipContext, "skip-context", false, "Do not regenerate context.md")
+	cmd.Flags().BoolVar(&o.skipReport, "skip-report", false, "Do not generate a report file")
+	cmd.Flags().BoolVar(&o.strict, "strict", false, "Treat check warnings as failures (exit code 1)")
+	cmd.Flags().BoolVar(&o.json, "json", false, "Output results as JSON")
+	return cmd
 }
 
-// runFinish executes the finish sequence while the project mutation lock is held.
-// The project lock is released (deferred) before this function's result is acted
-// upon, so os.Exit for --strict mode must happen outside the locked section.
-func runFinish(s *store.Store, exitNonZero *bool) error {
+// runFinish executes the finish sequence while the project mutation lock is
+// held. All failures are returned as typed errors; no os.Exit is used, so
+// deferred cleanup (including project lock release) always runs first.
+func runFinish(cmd *cobra.Command, s *store.Store, o *finishOptions) error {
+	out := cmd.OutOrStdout()
 	var jsonOut finishJSONOutput
 	var jsonErrors []string
 
-	if !finishJSON {
-		fmt.Println("=== CodeLedger Session Finish ===")
-		fmt.Println()
+	if !o.json {
+		fmt.Fprintln(out, "=== CodeLedger Session Finish ===")
+		fmt.Fprintln(out)
 	}
 
 	// Step 1: Check
-	if !finishJSON {
-		fmt.Println("[1/5] Running consistency check...")
+	if !o.json {
+		fmt.Fprintln(out, "[1/5] Running consistency check...")
 	}
 	result := service.RunCheck(s)
 	jsonOut.Check = result
 
 	hasCheckIssues := result.HasFailures()
-	if finishStrict && result.HasWarnings() {
+	if o.strict && result.HasWarnings() {
 		hasCheckIssues = true
 	}
 
-	if !finishJSON {
-		printCheckResult(result, false)
+	if !o.json {
+		printCheckResult(out, result, false)
 	}
 
 	var evtType string
 	if result.HasFailures() {
 		evtType = model.EventCheckFailed
-		if !finishJSON {
-			fmt.Println("WARNING: check found failures. Continuing finish sequence.")
+		if !o.json {
+			fmt.Fprintln(out, "WARNING: check found failures. Continuing finish sequence.")
 		}
 	} else {
 		evtType = model.EventCheckPassed
 	}
 	checkEvt := model.NewEvent(evtType, "", "", fmt.Sprintf("check: %d checks", len(result.Checks)))
-	if finishAgent != "" {
-		checkEvt.Agent = finishAgent
+	if o.agent != "" {
+		checkEvt.Agent = o.agent
 	}
 	_ = s.AppendEvent(checkEvt)
-	if !finishJSON {
-		fmt.Println()
+	if !o.json {
+		fmt.Fprintln(out)
 	}
 
 	// Step 2: Optionally complete a task
-	if finishTask != "" {
-		if finishResult == "" {
-			if !finishJSON {
-				fmt.Printf("[2/5] Task %s not completed: --result is required to complete a task (use --result passed|failed|skipped|unknown).\n", finishTask)
+	if o.task != "" {
+		if o.result == "" {
+			if !o.json {
+				fmt.Fprintf(out, "[2/5] Task %s not completed: --result is required to complete a task (use --result passed|failed|skipped|unknown).\n", o.task)
 			}
 		} else {
-			if !finishJSON {
-				fmt.Printf("[2/5] Completing task %s...\n", finishTask)
+			if !o.json {
+				fmt.Fprintf(out, "[2/5] Completing task %s...\n", o.task)
 			}
-			if err := service.CompleteTask(s, finishTask, finishFiles, finishTest, finishResult, finishNote, finishAutoFiles, finishCaptureDiff); err != nil {
-				if finishJSON {
-					jsonErrors = append(jsonErrors, fmt.Sprintf("failed to complete task %s: %v", finishTask, err))
+			if err := service.CompleteTask(s, o.task, o.files, o.test, o.result, o.note, o.autoFiles, o.captureDiff); err != nil {
+				if o.json {
+					jsonErrors = append(jsonErrors, fmt.Sprintf("failed to complete task %s: %v", o.task, err))
 				} else {
-					return fmt.Errorf("finish: failed to complete task %s: %w", finishTask, err)
+					return classifyErr(fmt.Sprintf("finish: failed to complete task %s", o.task), err)
 				}
 			} else {
-				jsonOut.TaskCompleted = finishTask
-				if !finishJSON {
-					fmt.Printf("  Completed task %s.\n", finishTask)
+				jsonOut.TaskCompleted = o.task
+				if !o.json {
+					fmt.Fprintf(out, "  Completed task %s.\n", o.task)
 				}
 			}
 		}
 	} else {
-		if !finishJSON {
-			fmt.Println("[2/5] No task to complete (--task not specified).")
+		if !o.json {
+			fmt.Fprintln(out, "[2/5] No task to complete (--task not specified).")
 		}
 	}
-	if !finishJSON {
-		fmt.Println()
+	if !o.json {
+		fmt.Fprintln(out)
 	}
 
 	// Step 3: Generate context
-	if !finishJSON {
-		fmt.Println("[3/5] Generating context...")
+	if !o.json {
+		fmt.Fprintln(out, "[3/5] Generating context...")
 	}
-	if !finishSkipContext {
+	if !o.skipContext {
 		ctx, err := contextgen.GenerateContext(s)
 		if err != nil {
-			if finishJSON {
+			if o.json {
 				jsonErrors = append(jsonErrors, fmt.Sprintf("context generation failed: %v", err))
 			} else {
-				return fmt.Errorf("finish: context generation failed: %w", err)
+				return classifyErr("finish: context generation failed", err)
 			}
 		} else {
 			if err := s.WriteContext(ctx); err != nil {
-				if finishJSON {
+				if o.json {
 					jsonErrors = append(jsonErrors, fmt.Sprintf("failed to write context.md: %v", err))
 				} else {
-					return fmt.Errorf("finish: failed to write context.md: %w", err)
+					return classifyErr("finish: failed to write context.md", err)
 				}
 			} else {
 				jsonOut.ContextUpdated = true
-				if !finishJSON {
-					fmt.Println("  context.md updated.")
+				if !o.json {
+					fmt.Fprintln(out, "  context.md updated.")
 				}
 			}
 		}
 	} else {
-		if !finishJSON {
-			fmt.Println("  Skipped (--skip-context).")
+		if !o.json {
+			fmt.Fprintln(out, "  Skipped (--skip-context).")
 		}
 	}
-	if !finishJSON {
-		fmt.Println()
+	if !o.json {
+		fmt.Fprintln(out)
 	}
 
 	// Step 4: Generate report
-	if !finishJSON {
-		fmt.Println("[4/5] Generating report...")
+	if !o.json {
+		fmt.Fprintln(out, "[4/5] Generating report...")
 	}
-	if !finishSkipReport {
+	if !o.skipReport {
 		report, err := reportgen.GenerateReport(s)
 		if err != nil {
-			if finishJSON {
+			if o.json {
 				jsonErrors = append(jsonErrors, fmt.Sprintf("report generation failed: %v", err))
 			} else {
-				return fmt.Errorf("finish: report generation failed: %w", err)
+				return classifyErr("finish: report generation failed", err)
 			}
 		} else {
 			date := time.Now().Format("2006-01-02")
 			reportPath := filepath.Join(s.ReportsDirPath(), date+"-report.md")
 			if err := os.MkdirAll(s.ReportsDirPath(), 0755); err != nil {
-				if finishJSON {
+				if o.json {
 					jsonErrors = append(jsonErrors, fmt.Sprintf("failed to create reports dir: %v", err))
 				} else {
-					return fmt.Errorf("finish: failed to create reports dir: %w", err)
+					return classifyErr("finish: failed to create reports dir", err)
 				}
 			} else {
 				if err := os.WriteFile(reportPath, []byte(report), 0644); err != nil {
-					if finishJSON {
+					if o.json {
 						jsonErrors = append(jsonErrors, fmt.Sprintf("failed to write report: %v", err))
 					} else {
-						return fmt.Errorf("finish: failed to write report: %w", err)
+						return classifyErr("finish: failed to write report", err)
 					}
 				} else {
 					jsonOut.ReportSaved = reportPath
-					if !finishJSON {
-						fmt.Printf("  Report saved: %s\n", reportPath)
+					if !o.json {
+						fmt.Fprintf(out, "  Report saved: %s\n", reportPath)
 					}
 				}
 			}
 		}
 	} else {
-		if !finishJSON {
-			fmt.Println("  Skipped (--skip-report).")
+		if !o.json {
+			fmt.Fprintln(out, "  Skipped (--skip-report).")
 		}
 	}
-	if !finishJSON {
-		fmt.Println()
+	if !o.json {
+		fmt.Fprintln(out)
 	}
 
 	// Step 5: Next suggested task + session event
-	if !finishJSON {
-		fmt.Println("[5/5] Next suggested task...")
+	if !o.json {
+		fmt.Fprintln(out, "[5/5] Next suggested task...")
 	}
 	status, err := service.GetStatus(s)
 	if err != nil {
-		if finishJSON {
+		if o.json {
 			jsonErrors = append(jsonErrors, fmt.Sprintf("status failed: %v", err))
 		} else {
-			return fmt.Errorf("finish: status failed: %w", err)
+			return classifyErr("finish: status failed", err)
 		}
 	} else {
 		if status.NextTask != nil {
 			nextStr := fmt.Sprintf("%s - %s", status.NextTask.ID, status.NextTask.Title)
 			jsonOut.NextTask = nextStr
-			if !finishJSON {
-				fmt.Printf("  Next: %s\n", nextStr)
+			if !o.json {
+				fmt.Fprintf(out, "  Next: %s\n", nextStr)
 			}
 		} else if status.Pending == 0 && status.InProgress == 0 && status.Blocked == 0 {
-			if !finishJSON {
-				fmt.Println("  All tasks complete. No next task.")
+			if !o.json {
+				fmt.Fprintln(out, "  All tasks complete. No next task.")
 			}
 		} else {
-			if !finishJSON {
-				fmt.Println("  No ready next task (dependencies unmet or all blocked).")
+			if !o.json {
+				fmt.Fprintln(out, "  No ready next task (dependencies unmet or all blocked).")
 			}
 		}
 	}
 
 	// Log session.finished event
 	finishEvt := model.NewEvent(model.EventSessionFinished, "", "", "session finished")
-	if finishAgent != "" {
-		finishEvt.Agent = finishAgent
+	if o.agent != "" {
+		finishEvt.Agent = o.agent
 	}
 	_ = s.AppendEvent(finishEvt)
 
-	if finishJSON {
+	if o.json {
 		if len(jsonErrors) > 0 {
 			jsonOut.Errors = jsonErrors
 		}
-		out, err := json.MarshalIndent(jsonOut, "", "  ")
-		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
+		if hasCheckIssues {
+			// The JSON error envelope replaces the result document so stdout
+			// always contains exactly one JSON document.
+			return checkFailedError(result, o.strict)
 		}
-		fmt.Println(string(out))
+		data, err := json.MarshalIndent(jsonOut, "", "  ")
+		if err != nil {
+			return clierr.Wrap(clierr.KindOperation, err, "failed to marshal JSON")
+		}
+		fmt.Fprintln(out, string(data))
 	} else {
-		fmt.Println()
-		fmt.Println("=== Session finished ===")
-	}
-
-	// Exit code: strict mode triggers non-zero on warnings too
-	if hasCheckIssues {
-		*exitNonZero = true
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "=== Session finished ===")
+		if hasCheckIssues {
+			return checkFailedError(result, o.strict)
+		}
 	}
 
 	return nil
-}
-
-func init() {
-	finishCmd.Flags().StringVar(&finishTask, "task", "", "Task ID to complete before finishing")
-	finishCmd.Flags().StringVar(&finishAgent, "agent", "", "Agent name performing the finish")
-	finishCmd.Flags().StringVar(&finishFiles, "files", "", "Comma-separated modified files (with --task)")
-	finishCmd.Flags().StringVar(&finishTest, "test", "", "Test command that was run (with --task)")
-	finishCmd.Flags().StringVar(&finishResult, "result", "", "Test result: passed, failed, skipped, unknown (with --task)")
-	finishCmd.Flags().StringVar(&finishNote, "note", "", "Completion note (with --task)")
-	finishCmd.Flags().BoolVar(&finishAutoFiles, "auto-files", false, "Auto-detect changed files from Git (with --task)")
-	finishCmd.Flags().BoolVar(&finishCaptureDiff, "capture-diff", false, "Capture full Git diff (with --task)")
-	finishCmd.Flags().BoolVar(&finishSkipContext, "skip-context", false, "Do not regenerate context.md")
-	finishCmd.Flags().BoolVar(&finishSkipReport, "skip-report", false, "Do not generate a report file")
-	finishCmd.Flags().BoolVar(&finishStrict, "strict", false, "Treat check warnings as failures (exit code 1)")
-	finishCmd.Flags().BoolVar(&finishJSON, "json", false, "Output results as JSON")
-	rootCmd.AddCommand(finishCmd)
 }

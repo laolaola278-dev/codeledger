@@ -3,24 +3,24 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 
+	"github.com/codeledger/codeledger/internal/clierr"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var (
-	checkJSON    bool
-	checkVerbose bool
-	checkStrict  bool
-)
+type checkOptions struct {
+	json    bool
+	verbose bool
+	strict  bool
+}
 
-var checkCmd = &cobra.Command{
-	Use:   "check",
-	Short: "Check .ctask project consistency",
-	Long: `Run a consistency check on the .ctask project state.
+func newCheckCmd(deps Dependencies) *cobra.Command {
+	o := &checkOptions{}
+	cmd := newCommand("check", "Check .ctask project consistency",
+		`Run a consistency check on the .ctask project state.
 
 Validates:
   - project.yaml is readable
@@ -35,11 +35,11 @@ Use --json for machine-readable output.
 Use --verbose for full detail on every check.
 Use --strict to treat warnings as failures (exit code 1 on any warn or fail).
 
-Exit code 0 if no failures (or no warnings in --strict mode), 1 otherwise.`,
-	Args: cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+Exit code 0 if no failures (or no warnings in --strict mode), 1 otherwise.`)
+	cmd.Args = noArgs()
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
@@ -55,30 +55,47 @@ Exit code 0 if no failures (or no warnings in --strict mode), 1 otherwise.`,
 		evt := model.NewEvent(evtType, "", "", fmt.Sprintf("%d checks, %d failures", len(result.Checks), countFailures(result)))
 		_ = s.AppendEvent(evt)
 
-		if checkJSON {
+		failing := result.HasFailures() || (o.strict && result.HasWarnings())
+
+		if o.json {
+			if failing {
+				// The JSON error envelope replaces the result document so
+				// stdout always contains exactly one JSON document.
+				return checkFailedError(result, o.strict)
+			}
 			out, err := json.MarshalIndent(result, "", "  ")
 			if err != nil {
-				return fmt.Errorf("failed to marshal JSON: %w", err)
+				return clierr.Wrap(clierr.KindOperation, err, "failed to marshal JSON")
 			}
-			fmt.Println(string(out))
-		} else {
-			printCheckResult(result, checkVerbose)
+			fmt.Fprintln(cmd.OutOrStdout(), string(out))
+			return nil
 		}
 
-		shouldExitNonZero := result.HasFailures()
-		if checkStrict && result.HasWarnings() {
-			shouldExitNonZero = true
-		}
-		if shouldExitNonZero {
-			os.Exit(1)
+		printCheckResult(cmd.OutOrStdout(), result, o.verbose)
+		if failing {
+			return checkFailedError(result, o.strict)
 		}
 		return nil
-	},
+	}
+
+	cmd.Flags().BoolVar(&o.json, "json", false, "Output check results as JSON")
+	cmd.Flags().BoolVar(&o.verbose, "verbose", false, "Show all checks including passing ones")
+	cmd.Flags().BoolVar(&o.strict, "strict", false, "Treat warnings as failures (exit code 1 on any warn or fail)")
+	return cmd
 }
 
-func printCheckResult(r *service.CheckResult, verbose bool) {
-	fmt.Println("CodeLedger consistency check")
-	fmt.Println()
+// checkFailedError builds the typed CHECK_FAILED error for a consistency
+// check that found failures (or warnings in strict mode).
+func checkFailedError(result *service.CheckResult, strict bool) error {
+	return clierr.New(clierr.KindCheckFailed,
+		"consistency check failed: %d failure(s), %d warning(s) (strict=%v)",
+		countFailures(result), countWarnings(result), strict)
+}
+
+// printCheckResult renders the consistency check report to w.
+func printCheckResult(w io.Writer, r *service.CheckResult, verbose bool) {
+	fmt.Fprintln(w, "CodeLedger consistency check")
+	fmt.Fprintln(w)
 
 	pass, fail, warn, info := 0, 0, 0, 0
 	for _, c := range r.Checks {
@@ -105,20 +122,20 @@ func printCheckResult(r *service.CheckResult, verbose bool) {
 			icon = "[INFO]"
 		}
 		if verbose || c.Status == service.CheckFail || c.Status == service.CheckWarn || c.Status == service.CheckInfo {
-			fmt.Printf("  %-6s %s", icon, c.Name)
+			fmt.Fprintf(w, "  %-6s %s", icon, c.Name)
 			if c.Message != "" {
-				fmt.Printf(" - %s", c.Message)
+				fmt.Fprintf(w, " - %s", c.Message)
 			}
-			fmt.Println()
+			fmt.Fprintln(w)
 		}
 	}
 
-	fmt.Println()
-	fmt.Printf("Summary: %d pass, %d info, %d warn, %d fail (total %d)\n", pass, info, warn, fail, len(r.Checks))
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Summary: %d pass, %d info, %d warn, %d fail (total %d)\n", pass, info, warn, fail, len(r.Checks))
 	if fail > 0 {
-		fmt.Println("Result: FAILED")
+		fmt.Fprintln(w, "Result: FAILED")
 	} else {
-		fmt.Println("Result: OK")
+		fmt.Fprintln(w, "Result: OK")
 	}
 }
 
@@ -132,9 +149,12 @@ func countFailures(r *service.CheckResult) int {
 	return n
 }
 
-func init() {
-	checkCmd.Flags().BoolVar(&checkJSON, "json", false, "Output check results as JSON")
-	checkCmd.Flags().BoolVar(&checkVerbose, "verbose", false, "Show all checks including passing ones")
-	checkCmd.Flags().BoolVar(&checkStrict, "strict", false, "Treat warnings as failures (exit code 1 on any warn or fail)")
-	rootCmd.AddCommand(checkCmd)
+func countWarnings(r *service.CheckResult) int {
+	n := 0
+	for _, c := range r.Checks {
+		if c.Status == service.CheckWarn {
+			n++
+		}
+	}
+	return n
 }

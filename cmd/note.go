@@ -4,35 +4,30 @@ import (
 	"fmt"
 
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 	"github.com/spf13/cobra"
 )
 
-var noteCmd = &cobra.Command{
-	Use:   "note <task-id> <note>",
-	Short: "Add a note to a task",
-	Long: `Append a note to a task without changing its status.
+func newNoteCmd(deps Dependencies) *cobra.Command {
+	cmd := newCommand("note <task-id> <note>", "Add a note to a task",
+		`Append a note to a task without changing its status.
 
-Use this to record findings, observations, or important context during work.`,
-	Args: cobra.ExactArgs(2),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		s := store.NewStore(".")
-		if err := s.RequireInit(); err != nil {
+Use this to record findings, observations, or important context during work.`)
+	cmd.Args = exactArgs(2)
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		s := newStore(deps)
+		if err := requireInit(s); err != nil {
 			return err
 		}
 
 		taskID := args[0]
 		note := args[1]
-		return withProjectLock(s, "note", "", taskID, func() error {
+		return withProjectLock(deps, s, "note", "", taskID, func() error {
 			if err := service.NoteTask(s, taskID, note); err != nil {
-				return fmt.Errorf("note failed: %w", err)
+				return classifyErr("note failed", err)
 			}
-			fmt.Printf("Added note to task %s.\n", taskID)
+			fmt.Fprintf(cmd.OutOrStdout(), "Added note to task %s.\n", taskID)
 			return nil
 		})
-	},
-}
-
-func init() {
-	rootCmd.AddCommand(noteCmd)
+	}
+	return cmd
 }

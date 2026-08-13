@@ -8,17 +8,16 @@ import (
 
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/service"
-	"github.com/codeledger/codeledger/internal/store"
 )
 
 func TestCmd_Finish_NoTask(t *testing.T) {
-	initTempProject(t)
-	_, err := runRootArgs(t, "add", "Task A")
-	if err != nil {
+	env := newTestEnv(t)
+	env.initProject()
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
 
-	out, err := runRootArgs(t, "finish")
+	out, err := env.run("finish")
 	if err != nil {
 		t.Fatalf("finish failed: %v", err)
 	}
@@ -36,32 +35,30 @@ func TestCmd_Finish_NoTask(t *testing.T) {
 	}
 
 	// Verify context.md was generated
-	if _, err := os.Stat(filepath.Join(".ctask", "context.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(env.Dir, ".ctask", "context.md")); err != nil {
 		t.Errorf("context.md not generated: %v", err)
 	}
 }
 
 func TestCmd_Finish_WithTask(t *testing.T) {
-	initTempProject(t)
-	_, err := runRootArgs(t, "add", "Implement auth")
-	if err != nil {
+	env := newTestEnv(t)
+	env.initProject()
+	if _, err := env.run("add", "Implement auth"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
-	_, err = runRootArgs(t, "add", "Review auth", "--depends", "TASK-001")
-	if err != nil {
+	if _, err := env.run("add", "Review auth", "--depends", "TASK-001"); err != nil {
 		t.Fatalf("add 2 failed: %v", err)
 	}
-	_, err = runRootArgs(t, "claim", "TASK-001", "--agent", "codex")
-	if err != nil {
+	if _, err := env.run("claim", "TASK-001", "--agent", "codex"); err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
 
 	// Write a file so --auto-files can detect it
-	if err := os.WriteFile("auth.go", []byte("package main\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(env.Dir, "auth.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatalf("failed to write auth.go: %v", err)
 	}
 
-	out, err := runRootArgs(t, "finish", "--task", "TASK-001", "--agent", "codex",
+	out, err := env.run("finish", "--task", "TASK-001", "--agent", "codex",
 		"--files", "auth.go", "--test", "go test ./...", "--result", "passed",
 		"--note", "done")
 	if err != nil {
@@ -72,7 +69,7 @@ func TestCmd_Finish_WithTask(t *testing.T) {
 	}
 
 	// Verify task is done
-	s := store.NewStore(".")
+	s := env.store()
 	task, err := service.GetTaskByID(s, "TASK-001")
 	if err != nil {
 		t.Fatalf("GetTaskByID failed: %v", err)
@@ -110,23 +107,22 @@ func TestCmd_Finish_WithTask(t *testing.T) {
 }
 
 func TestCmd_Finish_WithTaskNoResult(t *testing.T) {
-	initTempProject(t)
-	_, err := runRootArgs(t, "add", "Test task")
-	if err != nil {
+	env := newTestEnv(t)
+	env.initProject()
+	if _, err := env.run("add", "Test task"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
-	_, err = runRootArgs(t, "claim", "TASK-001", "--agent", "codex")
-	if err != nil {
+	if _, err := env.run("claim", "TASK-001", "--agent", "codex"); err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
 
 	// Write a file so --auto-files could detect it (though we won't use it)
-	if err := os.WriteFile("test.go", []byte("package main\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(env.Dir, "test.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatalf("failed to write test.go: %v", err)
 	}
 
 	// Run finish --task TASK-001 WITHOUT --result
-	out, err := runRootArgs(t, "finish", "--task", "TASK-001")
+	out, err := env.run("finish", "--task", "TASK-001")
 	// finish should not error — it prints a hint and continues
 	if err != nil {
 		t.Fatalf("finish --task (no result) failed: %v", err)
@@ -138,7 +134,7 @@ func TestCmd_Finish_WithTaskNoResult(t *testing.T) {
 	}
 
 	// Verify task is NOT done
-	s := store.NewStore(".")
+	s := env.store()
 	task, err := service.GetTaskByID(s, "TASK-001")
 	if err != nil {
 		t.Fatalf("GetTaskByID failed: %v", err)
@@ -176,13 +172,13 @@ func TestCmd_Finish_WithTaskNoResult(t *testing.T) {
 }
 
 func TestCmd_Finish_JSON(t *testing.T) {
-	initTempProject(t)
-	_, err := runRootArgs(t, "add", "Task A")
-	if err != nil {
+	env := newTestEnv(t)
+	env.initProject()
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
 
-	out, err := runRootArgs(t, "finish", "--json")
+	out, err := env.run("finish", "--json")
 	if err != nil {
 		t.Fatalf("finish --json failed: %v", err)
 	}
@@ -212,13 +208,13 @@ func TestCmd_Finish_JSON(t *testing.T) {
 }
 
 func TestCmd_Finish_SkipContext(t *testing.T) {
-	initTempProject(t)
-	_, err := runRootArgs(t, "add", "Task A")
-	if err != nil {
+	env := newTestEnv(t)
+	env.initProject()
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
 
-	out, err := runRootArgs(t, "finish", "--skip-context")
+	out, err := env.run("finish", "--skip-context")
 	if err != nil {
 		t.Fatalf("finish --skip-context failed: %v", err)
 	}
@@ -228,13 +224,13 @@ func TestCmd_Finish_SkipContext(t *testing.T) {
 }
 
 func TestCmd_Finish_SkipReport(t *testing.T) {
-	initTempProject(t)
-	_, err := runRootArgs(t, "add", "Task A")
-	if err != nil {
+	env := newTestEnv(t)
+	env.initProject()
+	if _, err := env.run("add", "Task A"); err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
 
-	out, err := runRootArgs(t, "finish", "--skip-report")
+	out, err := env.run("finish", "--skip-report")
 	if err != nil {
 		t.Fatalf("finish --skip-report failed: %v", err)
 	}
@@ -244,14 +240,9 @@ func TestCmd_Finish_SkipReport(t *testing.T) {
 }
 
 func TestCmd_Finish_NotInitialized(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ctask-noinit-*")
-	if err != nil {
-		t.Fatalf("MkdirTemp failed: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	chdir(t, dir)
+	env := newTestEnv(t)
 
-	_, err = runRootArgs(t, "finish")
+	_, err := env.run("finish")
 	if err == nil {
 		t.Error("expected error when project not initialized")
 	}

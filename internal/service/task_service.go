@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,16 @@ import (
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
 	"github.com/codeledger/codeledger/internal/util"
+)
+
+// Sentinel errors returned by the task service. Callers use errors.Is to
+// classify failures without string matching.
+var (
+	// ErrTaskNotFound is wrapped when an operation references an unknown task.
+	ErrTaskNotFound = errors.New("task not found")
+	// ErrInvalidPriority is wrapped when AddTask receives a priority outside
+	// low/medium/high.
+	ErrInvalidPriority = errors.New("invalid priority")
 )
 
 // AddTask adds a new task to the project.
@@ -23,8 +34,10 @@ func AddTask(s *store.Store, title, description, priority string, dependsOn []st
 		existingIDs[i] = t.ID
 	}
 
+	// Fail closed: an invalid priority is a caller error, never silently
+	// downgraded to medium. The CLI maps this to VALIDATION_ERROR (exit 2).
 	if !model.IsValidPriority(priority) {
-		priority = model.PriorityMedium
+		return nil, fmt.Errorf("%w: %q (must be low, medium, or high)", ErrInvalidPriority, priority)
 	}
 
 	now := util.NowRFC3339()
@@ -62,7 +75,7 @@ func findTaskByID(tl *model.TaskList, id string) (int, *model.Task, error) {
 			return i, &tl.Tasks[i], nil
 		}
 	}
-	return -1, nil, fmt.Errorf("task %s not found", id)
+	return -1, nil, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 }
 
 // StartTask sets a task's status to in_progress.
