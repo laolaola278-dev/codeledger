@@ -1049,80 +1049,291 @@ func TestForceDoneAudit_Fields(t *testing.T) {
 	}
 }
 
-// TestForceAudit_StartBlockNoteRetainedFormat verifies start/block/note still
-// emit the same full prior-field audit format (outcome "lease retained") and
-// never remove the lease, so the shared helper did not regress them.
-func TestForceAudit_StartBlockNoteRetainedFormat(t *testing.T) {
-	// start/block/note classify the prior state with the real clock
-	// (recordForcedOverride's frozen behavior), so plant the lease relative
-	// to real now with a wide margin to make state deterministically active.
-	t0 := time.Now().UTC()
-	runs := []struct {
-		name string
-		run  func(t *testing.T, s *store.Store, taskID string)
-	}{
-		{"start", func(t *testing.T, s *store.Store, taskID string) {
-			if err := StartTask(s, clock.FixedClock{T: t0}, taskID, lease.Auth{Agent: "admin", Force: true, Reason: "override"}); err != nil {
-				t.Fatalf("forced start failed: %v", err)
-			}
-		}},
-		{"block", func(t *testing.T, s *store.Store, taskID string) {
-			if err := BlockTask(s, clock.FixedClock{T: t0}, taskID, "blocked", lease.Auth{Agent: "admin", Force: true, Reason: "override"}); err != nil {
-				t.Fatalf("forced block failed: %v", err)
-			}
-		}},
-		{"note", func(t *testing.T, s *store.Store, taskID string) {
-			if err := NoteTask(s, clock.FixedClock{T: t0}, taskID, "n", lease.Auth{Agent: "admin", Force: true, Reason: "override"}); err != nil {
-				t.Fatalf("forced note failed: %v", err)
-			}
-		}},
-	}
-	for _, tc := range runs {
-		t.Run(tc.name, func(t *testing.T) {
-			s, _ := setupTestStore(t)
-			task := addTestTask(t, s, "Shared format "+tc.name, model.PriorityHigh, nil)
-			mustLease(t, s, clock.FixedClock{T: t0}, lease.StaticID("lease-old"), task.ID, "a1", "30m")
+// sbnCommands runs a forced start/block/note against a planted lease. Each
+// closure drives the real service production path; only the injected clock
+// and the target task differ per case.
+var sbnCommands = []struct {
+	name string
+	run  func(t *testing.T, s *store.Store, taskID string, clk clock.Clock, auth lease.Auth)
+}{
+	{"start", func(t *testing.T, s *store.Store, taskID string, clk clock.Clock, auth lease.Auth) {
+		if err := StartTask(s, clk, taskID, auth); err != nil {
+			t.Fatalf("forced start failed: %v", err)
+		}
+	}},
+	{"block", func(t *testing.T, s *store.Store, taskID string, clk clock.Clock, auth lease.Auth) {
+		if err := BlockTask(s, clk, taskID, "blocked", auth); err != nil {
+			t.Fatalf("forced block failed: %v", err)
+		}
+	}},
+	{"note", func(t *testing.T, s *store.Store, taskID string, clk clock.Clock, auth lease.Auth) {
+		if err := NoteTask(s, clk, taskID, "n", auth); err != nil {
+			t.Fatalf("forced note failed: %v", err)
+		}
+	}},
+}
 
-			tc.run(t, s, task.ID)
+// newFormatLock builds a well-formed (non-legacy) lease planted directly into
+// locks.yaml with deterministic timestamps derived from the injected clock.
+func newFormatLock(taskID, owner, leaseID string, acquiredAt, expiresAt time.Time) model.Lock {
+	return model.Lock{
+		TaskID: taskID, Agent: owner, Role: "developer",
+		LeaseID: leaseID, LeaseDuration: "30m",
+		AcquiredAt:  acquiredAt.Format(time.RFC3339),
+		ExpiresAt:   expiresAt.Format(time.RFC3339),
+		HeartbeatAt: acquiredAt.Format(time.RFC3339),
+	}
+}
+
+// lockFields returns the planted lock entry for taskID, or nil when the task
+// has no record.
+func lockFields(t *testing.T, s *store.Store, taskID string) *model.Lock {
+	t.Helper()
+	locks := readLockList(t, s)
+	for i := range locks.Locks {
+		if locks.Locks[i].TaskID == taskID {
+			l := locks.Locks[i]
+			return &l
+		}
+	}
+	return nil
+}
+
+// TestForceAudit_StartBlockNote_ActiveUnderInjectedTime proves the gate and
+// the forced-override audit share the injected clock. The injected instant
+// (2020-01-01) is far before the host wall clock, so the planted lease is
+// ACTIVE under injected time even though it is long expired under real wall
+// time. The audit must report state=active (matching the gate), outcome
+// "lease retained", and the lease must remain untouched. This fails on the
+// old implementation, which classified the prior state with time.Now().
+func TestForceAudit_StartBlockNote_ActiveUnderInjectedTime(t *testing.T) {
+	injected := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	expires := injected.Add(24 * time.Hour) // active at injected; before any plausible host "now"
+	auth := lease.Auth{Agent: "admin", Force: true, Reason: "override"}
+
+	for _, cmd := range sbnCommands {
+		t.Run(cmd.name, func(t *testing.T) {
+			s, _ := setupTestStore(t)
+			task := addTestTask(t, s, "Active-under-injected "+cmd.name, model.PriorityHigh, nil)
+			writeRawLock(t, s, newFormatLock(task.ID, "a1", "lease-old", injected.Add(-time.Hour), expires))
+
+			cmd.run(t, s, task.ID, clock.FixedClock{T: injected}, auth)
 
 			audit := findBrokenAudit(t, s, task.ID)
 			if audit.actor != "admin" || audit.reason != "override" ||
-				audit.owner != "a1" || audit.leaseID != "lease-old" || audit.state != "active" ||
-				audit.outcome != "lease retained" {
-				t.Errorf("audit fields wrong: %+v", audit)
+				audit.owner != "a1" || audit.leaseID != "lease-old" ||
+				audit.state != "active" || audit.outcome != "lease retained" {
+				t.Errorf("audit must classify with injected time (state=active), got %+v", audit)
 			}
-			if !hasLockFor(readLockList(t, s), task.ID) {
-				t.Error("start/block/note must retain the lease")
+			got := lockFields(t, s, task.ID)
+			if got == nil {
+				t.Fatal("start/block/note must retain the lease")
+			}
+			if got.Agent != "a1" || got.LeaseID != "lease-old" || got.ExpiresAt != expires.Format(time.RFC3339) {
+				t.Errorf("lease mutated by %s: %+v", cmd.name, got)
+			}
+		})
+	}
+}
+
+// TestForceAudit_StartBlockNote_ExpiredUnderInjectedTime is the inverse of
+// the previous test: the injected instant (2030-01-01) is far after the host
+// wall clock, so the planted lease is EXPIRED under injected time even though
+// it is still active under real wall time. The audit must report
+// state=expired (matching the gate) with outcome "lease retained" and leave
+// the lease untouched.
+func TestForceAudit_StartBlockNote_ExpiredUnderInjectedTime(t *testing.T) {
+	injected := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	expires := injected.Add(-24 * time.Hour) // expired at injected; after any plausible host "now"
+	auth := lease.Auth{Agent: "admin", Force: true, Reason: "override"}
+
+	for _, cmd := range sbnCommands {
+		t.Run(cmd.name, func(t *testing.T) {
+			s, _ := setupTestStore(t)
+			task := addTestTask(t, s, "Expired-under-injected "+cmd.name, model.PriorityHigh, nil)
+			writeRawLock(t, s, newFormatLock(task.ID, "a1", "lease-old", injected.Add(-2*time.Hour), expires))
+
+			cmd.run(t, s, task.ID, clock.FixedClock{T: injected}, auth)
+
+			audit := findBrokenAudit(t, s, task.ID)
+			if audit.actor != "admin" || audit.reason != "override" ||
+				audit.owner != "a1" || audit.leaseID != "lease-old" ||
+				audit.state != "expired" || audit.outcome != "lease retained" {
+				t.Errorf("audit must classify with injected time (state=expired), got %+v", audit)
+			}
+			got := lockFields(t, s, task.ID)
+			if got == nil {
+				t.Fatal("start/block/note must retain the lease")
+			}
+			if got.Agent != "a1" || got.LeaseID != "lease-old" || got.ExpiresAt != expires.Format(time.RFC3339) {
+				t.Errorf("lease mutated by %s: %+v", cmd.name, got)
+			}
+		})
+	}
+}
+
+// TestForceAudit_StartBlockNote_LegacyRetained verifies legacy records keep
+// their old owner, an empty old lease-id, and state=legacy regardless of the
+// clock, with outcome "lease retained" and an untouched entry.
+func TestForceAudit_StartBlockNote_LegacyRetained(t *testing.T) {
+	injected := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	auth := lease.Auth{Agent: "admin", Force: true, Reason: "override"}
+
+	for _, cmd := range sbnCommands {
+		t.Run(cmd.name, func(t *testing.T) {
+			s, _ := setupTestStore(t)
+			task := addTestTask(t, s, "Legacy "+cmd.name, model.PriorityHigh, nil)
+			writeRawLock(t, s, model.Lock{
+				TaskID: task.ID, Agent: "old-agent", Role: "developer",
+				AcquiredAt: injected.Format(time.RFC3339),
+				ExpiresAt:  injected.Add(2 * time.Hour).Format(time.RFC3339),
+			})
+
+			cmd.run(t, s, task.ID, clock.FixedClock{T: injected}, auth)
+
+			audit := findBrokenAudit(t, s, task.ID)
+			if audit.actor != "admin" || audit.reason != "override" ||
+				audit.owner != "old-agent" || audit.leaseID != "" ||
+				audit.state != "legacy" || audit.outcome != "lease retained" {
+				t.Errorf("legacy audit fields wrong: %+v", audit)
+			}
+			got := lockFields(t, s, task.ID)
+			if got == nil {
+				t.Fatal("start/block/note must retain the legacy lease")
+			}
+			if got.Agent != "old-agent" || got.LeaseID != "" || !got.Legacy() {
+				t.Errorf("legacy lease mutated by %s: %+v", cmd.name, got)
+			}
+		})
+	}
+}
+
+// sequenceClock returns successive fixed instants and counts every Now call.
+// It proves gate and audit share ONE operation-scoped instant: a second
+// classification-time clock read (or a wall-clock fallback) would cross the
+// expiry boundary between the first and second instants, so the audit state
+// would disagree with the captured instant and the call count would exceed 1.
+type sequenceClock struct {
+	times []time.Time
+	calls int
+}
+
+func (c *sequenceClock) Now() time.Time {
+	c.calls++
+	if c.calls <= len(c.times) {
+		return c.times[c.calls-1].UTC()
+	}
+	return c.times[len(c.times)-1].UTC()
+}
+
+// TestForceAudit_StartBlockNote_SingleOperationNow verifies the whole service
+// operation reads the injected clock exactly once: the gate, the prior-state
+// snapshot, and UpdatedAt all share the captured instant. The planted lease
+// is active at the first injected instant and expired at the second, so any
+// second clock read would misclassify the audit. This fails on the old
+// implementation (two clk.Now reads plus a time.Now() fallback in the audit).
+func TestForceAudit_StartBlockNote_SingleOperationNow(t *testing.T) {
+	first := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)  // lease active here
+	second := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC) // lease expired here
+	expires := first.Add(24 * time.Hour)
+	auth := lease.Auth{Agent: "admin", Force: true, Reason: "override"}
+
+	for _, cmd := range sbnCommands {
+		t.Run(cmd.name, func(t *testing.T) {
+			s, _ := setupTestStore(t)
+			task := addTestTask(t, s, "Single-now "+cmd.name, model.PriorityHigh, nil)
+			writeRawLock(t, s, newFormatLock(task.ID, "a1", "lease-old", first.Add(-time.Hour), expires))
+			clk := &sequenceClock{times: []time.Time{first, second}}
+
+			cmd.run(t, s, task.ID, clk, auth)
+
+			if got := clk.calls; got != 1 {
+				t.Errorf("operation read the injected clock %d times; gate and audit must share ONE operation-scoped now", got)
+			}
+			audit := findBrokenAudit(t, s, task.ID)
+			if audit.state != "active" || audit.outcome != "lease retained" {
+				t.Errorf("audit must classify with the single captured instant (active), got %+v", audit)
 			}
 		})
 	}
 }
 
 // TestForceValidationFailure_NoOverrideEvent verifies that an invalid --force
-// (missing reason or actor) never writes a lease_broken override event and
-// never removes the lease.
+// (missing reason or actor) on ANY lease-protected mutation never writes a
+// lease_broken override event and never removes the lease.
 func TestForceValidationFailure_NoOverrideEvent(t *testing.T) {
-	s, _ := setupTestStore(t)
-	task := addTestTask(t, s, "No audit on invalid force", model.PriorityHigh, nil)
 	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	clk, newID := leaseFixture(t0)
-	mustLease(t, s, clk, newID, task.ID, "a1", "30m")
-
-	for _, auth := range []lease.Auth{
+	badAuths := []lease.Auth{
 		{Agent: "admin", Force: true}, // missing reason
 		{Force: true, Reason: "x"},    // missing actor
 		{Force: true},                 // both missing
-	} {
-		err := ReleaseTask(s, clk, task.ID, auth)
-		if !errors.Is(err, ErrForceReasonRequired) && !errors.Is(err, ErrForceAgentRequired) {
-			t.Fatalf("expected force validation error, got: %v", err)
-		}
+	}
+	commands := []struct {
+		name string
+		run  func(t *testing.T, s *store.Store, taskID string, auth lease.Auth)
+	}{
+		{"release", func(t *testing.T, s *store.Store, taskID string, auth lease.Auth) {
+			err := ReleaseTask(s, clock.FixedClock{T: t0}, taskID, auth)
+			if !errors.Is(err, ErrForceReasonRequired) && !errors.Is(err, ErrForceAgentRequired) {
+				t.Fatalf("expected force validation error, got: %v", err)
+			}
+		}},
+		{"start", func(t *testing.T, s *store.Store, taskID string, auth lease.Auth) {
+			err := StartTask(s, clock.FixedClock{T: t0}, taskID, auth)
+			if !errors.Is(err, ErrForceReasonRequired) && !errors.Is(err, ErrForceAgentRequired) {
+				t.Fatalf("expected force validation error, got: %v", err)
+			}
+		}},
+		{"block", func(t *testing.T, s *store.Store, taskID string, auth lease.Auth) {
+			err := BlockTask(s, clock.FixedClock{T: t0}, taskID, "blocked", auth)
+			if !errors.Is(err, ErrForceReasonRequired) && !errors.Is(err, ErrForceAgentRequired) {
+				t.Fatalf("expected force validation error, got: %v", err)
+			}
+		}},
+		{"note", func(t *testing.T, s *store.Store, taskID string, auth lease.Auth) {
+			err := NoteTask(s, clock.FixedClock{T: t0}, taskID, "n", auth)
+			if !errors.Is(err, ErrForceReasonRequired) && !errors.Is(err, ErrForceAgentRequired) {
+				t.Fatalf("expected force validation error, got: %v", err)
+			}
+		}},
+	}
+	for _, cmd := range commands {
+		t.Run(cmd.name, func(t *testing.T) {
+			for _, auth := range badAuths {
+				s, _ := setupTestStore(t)
+				task := addTestTask(t, s, "No audit on invalid force", model.PriorityHigh, nil)
+				mustLease(t, s, clock.FixedClock{T: t0}, lease.StaticID("lease-old"), task.ID, "a1", "30m")
+
+				cmd.run(t, s, task.ID, auth)
+
+				events, _ := s.ReadEvents()
+				if hasEvent(events, model.EventTaskLeaseBroken) {
+					t.Error("invalid force must not write a lease_broken audit event")
+				}
+				if !hasLockFor(readLockList(t, s), task.ID) {
+					t.Error("invalid force removed the lease")
+				}
+			}
+		})
+	}
+}
+
+// TestForceMutationFailure_NoOverrideEvent verifies that a forced operation
+// that fails AFTER the gate (here: starting a task whose dependency is not
+// done) never writes a task.lease_broken "success" audit.
+func TestForceMutationFailure_NoOverrideEvent(t *testing.T) {
+	s, _ := setupTestStore(t)
+	dep := addTestTask(t, s, "dep", model.PriorityHigh, nil)
+	task := addTestTask(t, s, "has unmet dependency", model.PriorityHigh, []string{dep.ID})
+	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	writeRawLock(t, s, newFormatLock(task.ID, "a1", "lease-old", t0.Add(-time.Hour), t0.Add(30*time.Minute)))
+
+	err := StartTask(s, clock.FixedClock{T: t0}, task.ID, lease.Auth{Agent: "admin", Force: true, Reason: "override"})
+	if err == nil {
+		t.Fatal("expected start to fail on the unmet dependency")
 	}
 	events, _ := s.ReadEvents()
 	if hasEvent(events, model.EventTaskLeaseBroken) {
-		t.Error("invalid force must not write a lease_broken audit event")
-	}
-	if !hasLockFor(readLockList(t, s), task.ID) {
-		t.Error("invalid force removed the lease")
+		t.Error("mutation failure must not write a lease_broken success audit")
 	}
 }

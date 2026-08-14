@@ -92,10 +92,18 @@ func StartTask(s *store.Store, clk clock.Clock, taskID string, auth lease.Auth) 
 	if err != nil {
 		return err
 	}
-	res, err := gateLease(locks, clk.Now(), taskID, auth, false)
+	// One operation-scoped instant: the gate decision, the prior-state audit
+	// snapshot, and the task timestamp all share this single injected-clock
+	// read so the authorization and the forced-override audit can never
+	// observe different times (or fall back to host wall time).
+	now := clk.Now()
+	res, err := gateLease(locks, now, taskID, auth, false)
 	if err != nil {
 		return err
 	}
+	// Immutable snapshot of the prior record, classified under the same now
+	// as the gate, taken before any mutation.
+	prior := snapshotLock(res.entry, now)
 
 	tl, err := s.ReadTasks()
 	if err != nil {
@@ -123,7 +131,7 @@ func StartTask(s *store.Store, clk clock.Clock, taskID string, auth lease.Auth) 
 	}
 
 	task.Status = model.StatusInProgress
-	task.UpdatedAt = clk.Now().UTC().Format(time.RFC3339)
+	task.UpdatedAt = now.UTC().Format(time.RFC3339)
 	tl.Tasks[idx] = *task
 
 	if err := s.WriteTasks(tl); err != nil {
@@ -133,7 +141,7 @@ func StartTask(s *store.Store, clk clock.Clock, taskID string, auth lease.Auth) 
 	// Audit a forced override without touching the lease itself (start never
 	// removes or modifies the existing lease).
 	if res.forced {
-		return recordForcedOverride(s, taskID, task.Title, auth, res.entry)
+		return recordForcedOverrideAudit(s, taskID, task.Title, auth, prior, "lease retained")
 	}
 
 	evt := model.NewEvent(model.EventTaskStarted, taskID, task.Title, "")
@@ -342,15 +350,6 @@ func removeLease(s *store.Store, taskID string) error {
 	return s.WriteLocks(locks)
 }
 
-// recordForcedOverride appends a task.lease_broken audit event recording the
-// actor, reason, and the previous owner/lease/state. It is used by mutations
-// that honor a --force override without removing the existing lease (start /
-// block / note): the fence is overridden for this one mutation but the lease
-// itself is retained so other agents remain fenced out.
-func recordForcedOverride(s *store.Store, taskID, title string, auth lease.Auth, entry *model.Lock) error {
-	return recordForcedOverrideAudit(s, taskID, title, auth, snapshotLock(entry, time.Now()), "lease retained")
-}
-
 // BlockTask sets a task's status to blocked with a reason.
 //
 // Lease contract: identical to StartTask - a lock record requires exact owner
@@ -361,10 +360,18 @@ func BlockTask(s *store.Store, clk clock.Clock, taskID, reason string, auth leas
 	if err != nil {
 		return err
 	}
-	res, err := gateLease(locks, clk.Now(), taskID, auth, false)
+	// One operation-scoped instant: the gate decision, the prior-state audit
+	// snapshot, and the task timestamp all share this single injected-clock
+	// read so the authorization and the forced-override audit can never
+	// observe different times (or fall back to host wall time).
+	now := clk.Now()
+	res, err := gateLease(locks, now, taskID, auth, false)
 	if err != nil {
 		return err
 	}
+	// Immutable snapshot of the prior record, classified under the same now
+	// as the gate, taken before any mutation.
+	prior := snapshotLock(res.entry, now)
 
 	tl, err := s.ReadTasks()
 	if err != nil {
@@ -382,7 +389,7 @@ func BlockTask(s *store.Store, clk clock.Clock, taskID, reason string, auth leas
 
 	task.Status = model.StatusBlocked
 	task.BlockedReason = reason
-	task.UpdatedAt = clk.Now().UTC().Format(time.RFC3339)
+	task.UpdatedAt = now.UTC().Format(time.RFC3339)
 	tl.Tasks[idx] = *task
 
 	if err := s.WriteTasks(tl); err != nil {
@@ -390,7 +397,7 @@ func BlockTask(s *store.Store, clk clock.Clock, taskID, reason string, auth leas
 	}
 
 	if res.forced {
-		return recordForcedOverride(s, taskID, task.Title, auth, res.entry)
+		return recordForcedOverrideAudit(s, taskID, task.Title, auth, prior, "lease retained")
 	}
 
 	evt := model.NewEvent(model.EventTaskBlocked, taskID, task.Title, reason)
@@ -410,10 +417,18 @@ func NoteTask(s *store.Store, clk clock.Clock, taskID, note string, auth lease.A
 	if err != nil {
 		return err
 	}
-	res, err := gateLease(locks, clk.Now(), taskID, auth, false)
+	// One operation-scoped instant: the gate decision, the prior-state audit
+	// snapshot, and the task timestamp all share this single injected-clock
+	// read so the authorization and the forced-override audit can never
+	// observe different times (or fall back to host wall time).
+	now := clk.Now()
+	res, err := gateLease(locks, now, taskID, auth, false)
 	if err != nil {
 		return err
 	}
+	// Immutable snapshot of the prior record, classified under the same now
+	// as the gate, taken before any mutation.
+	prior := snapshotLock(res.entry, now)
 
 	tl, err := s.ReadTasks()
 	if err != nil {
@@ -430,7 +445,7 @@ func NoteTask(s *store.Store, clk clock.Clock, taskID, note string, auth lease.A
 	} else {
 		task.Notes = note
 	}
-	task.UpdatedAt = clk.Now().UTC().Format(time.RFC3339)
+	task.UpdatedAt = now.UTC().Format(time.RFC3339)
 	tl.Tasks[idx] = *task
 
 	if err := s.WriteTasks(tl); err != nil {
@@ -438,7 +453,7 @@ func NoteTask(s *store.Store, clk clock.Clock, taskID, note string, auth lease.A
 	}
 
 	if res.forced {
-		return recordForcedOverride(s, taskID, task.Title, auth, res.entry)
+		return recordForcedOverrideAudit(s, taskID, task.Title, auth, prior, "lease retained")
 	}
 
 	evt := model.NewEvent(model.EventTaskNoted, taskID, task.Title, note)
