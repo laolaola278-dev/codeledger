@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codeledger/codeledger/internal/clock"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
 )
@@ -42,7 +43,7 @@ func TestRunCheck_CleanProjectPasses(t *testing.T) {
 	evt := model.NewEvent(model.EventTaskCreated, "TASK-001", "Task A", "")
 	s.AppendEvent(evt)
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	if r.HasFailures() {
 		t.Fatalf("expected no failures on clean project, got: %+v", r.Checks)
@@ -64,7 +65,7 @@ func TestRunCheck_DuplicateTaskIDs(t *testing.T) {
 		{ID: "TASK-001", Title: "Duplicate", Status: model.StatusPending, Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-ids-unique")
 	if c == nil {
@@ -85,7 +86,7 @@ func TestRunCheck_InvalidStatus(t *testing.T) {
 		{ID: "TASK-002", Title: "Bad2", Status: "invalid2", Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-status-valid")
 	if c == nil {
@@ -112,7 +113,7 @@ func TestRunCheck_InvalidPriority(t *testing.T) {
 		{ID: "TASK-001", Title: "Bad priority", Status: model.StatusPending, Priority: "urgent"},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-priority-valid")
 	if c == nil {
@@ -129,7 +130,7 @@ func TestRunCheck_DoneTaskMissingCompletedAt(t *testing.T) {
 		{ID: "TASK-001", Title: "Done no ts", Status: model.StatusDone, Priority: model.PriorityMedium, CompletedAt: ""},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "done-tasks-completed-at")
 	if c == nil {
@@ -150,7 +151,7 @@ func TestRunCheck_MissingDependency(t *testing.T) {
 		{ID: "TASK-001", Title: "Missing dep", Status: model.StatusPending, Priority: model.PriorityMedium, DependsOn: []string{"TASK-999"}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-dependencies")
 	if c == nil {
@@ -167,7 +168,7 @@ func TestRunCheck_MissingEvidenceFile(t *testing.T) {
 		{ID: "TASK-001", Title: "Missing ev", Status: model.StatusDone, Priority: model.PriorityMedium, CompletedAt: "2025-01-01T00:00:00Z", Evidence: []string{"evidence/TASK-001.md"}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "evidence-files")
 	if c == nil {
@@ -181,11 +182,17 @@ func TestRunCheck_MissingEvidenceFile(t *testing.T) {
 func TestRunCheck_ExistingEvidenceFile(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Evidence task", model.PriorityMedium, nil)
-	if err := CompleteTask(s, task.ID, "main.go", "go test ./...", model.TestResultPassed, "done", false, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{
+		Files:     "main.go",
+		Test:      "go test ./...",
+		Result:    model.TestResultPassed,
+		Note:      "done",
+		AutoFiles: false,
+	}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "evidence-files")
 	if c == nil {
@@ -205,7 +212,7 @@ func TestRunCheck_OrphanLock(t *testing.T) {
 		{TaskID: "TASK-999", Agent: "ghost", Role: "dev", AcquiredAt: now, ExpiresAt: future, HeartbeatAt: now},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "locks-task-exists")
 	if c == nil {
@@ -224,7 +231,7 @@ func TestRunCheck_ExpiredLock(t *testing.T) {
 		{TaskID: task.ID, Agent: "old", Role: "dev", AcquiredAt: past, ExpiresAt: past, HeartbeatAt: past},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "locks-expired")
 	if c == nil {
@@ -244,7 +251,7 @@ func TestRunCheck_ValidLocksPass(t *testing.T) {
 		{TaskID: task.ID, Agent: "agent1", Role: "dev", AcquiredAt: now, ExpiresAt: future, HeartbeatAt: now},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	for _, name := range []string{"locks.yaml", "locks-task-exists", "locks-expired"} {
 		c := findCheck(r, name)
@@ -261,7 +268,7 @@ func TestRunCheck_EventsPresent(t *testing.T) {
 	s, _ := setupTestStore(t)
 	s.AppendEvent(model.NewEvent(model.EventTaskCreated, "", "test", ""))
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "events.jsonl")
 	if c == nil {
@@ -276,7 +283,7 @@ func TestRunCheck_MissingEventsFile(t *testing.T) {
 	s, _ := setupTestStore(t)
 	os.Remove(s.EventsPath())
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "events.jsonl")
 	if c == nil {
@@ -292,7 +299,7 @@ func TestRunCheck_MissingLocksFile(t *testing.T) {
 	addTestTask(t, s, "Task", model.PriorityMedium, nil)
 	os.Remove(s.LocksPath())
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "locks.yaml")
 	if c == nil {
@@ -309,7 +316,7 @@ func TestRunCheck_SelfDependency(t *testing.T) {
 		{ID: "TASK-001", Title: "Self dep", Status: model.StatusPending, Priority: model.PriorityMedium, DependsOn: []string{"TASK-001"}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-no-self-dependency")
 	if c == nil {
@@ -329,7 +336,7 @@ func TestRunCheck_InvalidTaskIDFormat(t *testing.T) {
 		{ID: "BAD-ID", Title: "Bad ID", Status: model.StatusPending, Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-id-format")
 	if c == nil {
@@ -346,7 +353,7 @@ func TestRunCheck_InvalidTestResult(t *testing.T) {
 		{ID: "TASK-001", Title: "Bad result", Status: model.StatusPending, Priority: model.PriorityMedium, Test: model.TaskTest{Result: "not-a-real-result"}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "task-test-result-valid")
 	if c == nil {
@@ -363,7 +370,7 @@ func TestRunCheck_DoneTaskNoFiles(t *testing.T) {
 		{ID: "TASK-001", Title: "Done no files", Status: model.StatusDone, Priority: model.PriorityMedium, CompletedAt: "2025-01-01T00:00:00Z", Files: []string{}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "done-tasks-files")
 	if c == nil {
@@ -380,7 +387,7 @@ func TestRunCheck_DoneTaskUnknownResult(t *testing.T) {
 		{ID: "TASK-001", Title: "Done unknown", Status: model.StatusDone, Priority: model.PriorityMedium, CompletedAt: "2025-01-01T00:00:00Z", Files: []string{"main.go"}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "done-tasks-test-result")
 	if c == nil {
@@ -397,7 +404,7 @@ func TestRunCheck_DoneTaskNoEvidence(t *testing.T) {
 		{ID: "TASK-001", Title: "Done no ev", Status: model.StatusDone, Priority: model.PriorityMedium, CompletedAt: "2025-01-01T00:00:00Z", Files: []string{"main.go"}, Test: model.TaskTest{Result: model.TestResultPassed}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "done-tasks-evidence")
 	if c == nil {
@@ -414,7 +421,7 @@ func TestRunCheck_BlockedTaskNoReason(t *testing.T) {
 		{ID: "TASK-001", Title: "Blocked no reason", Status: model.StatusBlocked, Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "blocked-tasks-reason")
 	if c == nil {
@@ -432,7 +439,7 @@ func TestRunCheck_MultipleInProgress(t *testing.T) {
 		{ID: "TASK-002", Title: "In progress B", Status: model.StatusInProgress, Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "multiple-in-progress")
 	if c == nil {
@@ -455,7 +462,7 @@ func TestRunCheck_MultipleActiveLocks(t *testing.T) {
 		{TaskID: "TASK-001", Agent: "agent2", Role: "dev", AcquiredAt: now, ExpiresAt: future, HeartbeatAt: now},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "locks-duplicate")
 	if c == nil {
@@ -477,7 +484,7 @@ func TestRunCheck_DoneTaskWithActiveLock(t *testing.T) {
 		{TaskID: "TASK-001", Agent: "agent1", Role: "dev", AcquiredAt: now, ExpiresAt: future, HeartbeatAt: now},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "locks-done-task")
 	if c == nil {
@@ -494,7 +501,7 @@ func TestRunCheck_HasWarnings(t *testing.T) {
 		{ID: "TASK-001", Title: "Blocked no reason", Status: model.StatusBlocked, Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	if !r.HasWarnings() {
 		t.Error("expected HasWarnings=true for blocked task with no reason")
@@ -508,7 +515,7 @@ func TestRunCheck_EvidenceDirCheck(t *testing.T) {
 	s, _ := setupTestStore(t)
 	addTestTask(t, s, "Task", model.PriorityMedium, nil)
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "evidence-dir")
 	if c == nil {
@@ -525,7 +532,7 @@ func TestRunCheck_HasFailuresAndPassedFlag(t *testing.T) {
 		{ID: "TASK-001", Title: "Bad", Status: "invalid", Priority: model.PriorityMedium},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	if !r.HasFailures() {
 		t.Error("expected HasFailures=true")
@@ -540,7 +547,7 @@ func TestRunCheck_DoneTaskMissingDependency(t *testing.T) {
 		{ID: "TASK-001", Title: "Done missing dep", Status: model.StatusDone, Priority: model.PriorityMedium, CompletedAt: "2025-01-01T00:00:00Z", DependsOn: []string{"TASK-999"}},
 	})
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "done-task-dependencies")
 	if c == nil {
@@ -558,7 +565,7 @@ func TestRunCheck_GitNotRepo(t *testing.T) {
 	s, _ := setupTestStore(t)
 	addTestTask(t, s, "Task", model.PriorityMedium, nil)
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "git-repo")
 	if c == nil {
@@ -589,7 +596,7 @@ func TestRunCheck_GitChangedFilesNotBound(t *testing.T) {
 		t.Fatalf("failed to write unbound file: %v", err)
 	}
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "git-unbound-changes")
 	if c == nil {
@@ -622,7 +629,7 @@ func TestRunCheck_GitChangedFilesInCtaskDir(t *testing.T) {
 		t.Fatalf("failed to write ctask file: %v", err)
 	}
 
-	r := RunCheck(s)
+	r := RunCheck(s, clock.RealClock{})
 
 	c := findCheck(r, "git-unbound-changes")
 	if c == nil {

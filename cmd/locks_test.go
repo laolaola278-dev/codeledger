@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -175,10 +174,10 @@ func TestCmd_ConcurrentClaimOnlyOneSucceeds(t *testing.T) {
 		t.Errorf("expected exactly 1 successful claim, got %d", successes)
 	}
 
-	// The project lock must not be left behind after all claims completed.
-	if _, err := os.Stat(filepath.Join(env.Dir, ".ctask", store.ProjectLockFile)); !os.IsNotExist(err) {
-		t.Errorf("project lock file left behind: %v", err)
-	}
+	// The project lock must have been released after all claims completed.
+	// P1 keeps the lock file as an empty placeholder, so "released" means no
+	// active lock.
+	assertNoActiveProjectLock(t, env.Dir)
 }
 
 // TestCmd_Locks_DoesNotAcquireProjectLock verifies the read-only locks

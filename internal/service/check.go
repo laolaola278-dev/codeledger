@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/codeledger/codeledger/internal/clock"
 	"github.com/codeledger/codeledger/internal/git"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
@@ -70,7 +71,10 @@ var taskIDPattern = regexp.MustCompile(`^[A-Z]+-\d+$`)
 // RunCheck performs a full consistency check of the .ctask project state.
 // It validates project.yaml, tasks.yaml, locks.yaml, evidence files,
 // and cross-references between them.
-func RunCheck(s *store.Store) *CheckResult {
+func RunCheck(s *store.Store, clk clock.Clock) *CheckResult {
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
 	r := &CheckResult{Passed: true}
 
 	// 1. project.yaml
@@ -84,7 +88,7 @@ func RunCheck(s *store.Store) *CheckResult {
 	tl, err := s.ReadTasks()
 	if err != nil {
 		r.add("tasks.yaml", CheckFail, fmt.Sprintf("cannot read: %v", err))
-		r.checkLocks(s, nil)
+		r.checkLocks(s, nil, clk)
 		r.checkEvents(s)
 		return r
 	}
@@ -282,7 +286,7 @@ func RunCheck(s *store.Store) *CheckResult {
 	}
 
 	// 7. Locks
-	r.checkLocks(s, idSet)
+	r.checkLocks(s, idSet, clk)
 
 	// 8. Events
 	r.checkEvents(s)
@@ -294,7 +298,7 @@ func RunCheck(s *store.Store) *CheckResult {
 }
 
 // checkLocks validates locks.yaml and cross-references with tasks.
-func (r *CheckResult) checkLocks(s *store.Store, taskIDs map[string]bool) {
+func (r *CheckResult) checkLocks(s *store.Store, taskIDs map[string]bool, clk clock.Clock) {
 	locks, err := s.ReadLocks()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -308,19 +312,24 @@ func (r *CheckResult) checkLocks(s *store.Store, taskIDs map[string]bool) {
 
 	var orphanLocks []string
 	var expiredLocks []string
+	var legacyLocks []string
 	var doneTaskLocks []string
 	var multiLockTasks []string
 	lockCount := make(map[string]int)
+	now := clk.Now()
 
 	for _, l := range locks.Locks {
 		if taskIDs != nil && !taskIDs[l.TaskID] {
 			orphanLocks = append(orphanLocks, l.TaskID)
 		}
-		if l.IsExpired() {
+		if l.ExpiredAt(now) {
 			expiredLocks = append(expiredLocks, l.TaskID)
 		}
+		if l.Legacy() && !l.ExpiredAt(now) {
+			legacyLocks = append(legacyLocks, l.TaskID)
+		}
 		// Count active (non-expired) locks per task
-		if !l.IsExpired() {
+		if !l.ExpiredAt(now) {
 			lockCount[l.TaskID]++
 		}
 	}
@@ -351,6 +360,11 @@ func (r *CheckResult) checkLocks(s *store.Store, taskIDs map[string]bool) {
 		r.add("locks-expired", CheckWarn, fmt.Sprintf("expired lock(s): %s", joinIDs(expiredLocks)))
 	} else {
 		r.add("locks-expired", CheckPass, "no expired locks")
+	}
+	if len(legacyLocks) > 0 {
+		r.add("locks-lease-valid", CheckWarn, fmt.Sprintf("legacy lock(s) without a valid lease (fail-closed until --force --reason): %s", joinIDs(legacyLocks)))
+	} else {
+		r.add("locks-lease-valid", CheckPass, "all locks have valid leases")
 	}
 	if len(multiLockTasks) > 0 {
 		r.add("locks-duplicate", CheckFail, fmt.Sprintf("multiple active locks on same task: %s", joinIDs(multiLockTasks)))

@@ -27,14 +27,22 @@ const (
 	KindLockConflict   Kind = "LOCK_CONFLICT"
 	KindOperation      Kind = "OPERATION_FAILED"
 	KindInternal       Kind = "INTERNAL_ERROR"
+
+	// P1 lease contract.
+	KindLeaseConflict Kind = "LEASE_CONFLICT" // lease held by another owner, or claim blocked by an active lease
+	KindLeaseExpired  Kind = "LEASE_EXPIRED"  // operation requires a valid lease but it has expired
+	KindForceRequired Kind = "FORCE_REQUIRED" // breaking a lease requires --force with an explicit --reason
+	KindLeaseNotFound Kind = "LEASE_NOT_FOUND"
+	KindLegacyState   Kind = "LEGACY_STATE" // pre-lease lock format: fail-closed, explicit force+reason required
 )
 
 // Process exit codes. These are part of the public contract:
 //
 //	0 - success
-//	1 - business execution failure or check/strict failure
-//	2 - usage/validation failure
-//	3 - contention/precondition (project mutation lock conflict)
+//	1 - business execution failure, check/strict failure, lease/legacy state failures
+//	2 - usage/validation failure, including --force without the required --reason
+//	3 - contention/precondition: project mutation lock conflict, task lease
+//	    conflict, or an operation on an expired lease
 const (
 	ExitOK         = 0
 	ExitBusiness   = 1
@@ -99,9 +107,9 @@ func ExitCode(err error) int {
 		return ExitOK
 	}
 	switch KindOf(err) {
-	case KindUsage, KindValidation:
+	case KindUsage, KindValidation, KindForceRequired:
 		return ExitUsage
-	case KindLockConflict:
+	case KindLockConflict, KindLeaseConflict, KindLeaseExpired:
 		return ExitContention
 	default:
 		return ExitBusiness

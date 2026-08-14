@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
@@ -166,18 +167,32 @@ func TestBinary_AddInvalidPriority_Exit2AndNoTaskAdded(t *testing.T) {
 	if len(tl.Tasks) != 0 {
 		t.Errorf("expected no task added after invalid priority, got %d task(s)", len(tl.Tasks))
 	}
-	// The project lock must have been released despite the failure.
-	if _, err := os.Stat(filepath.Join(dir, ".ctask", store.ProjectLockFile)); !os.IsNotExist(err) {
-		t.Errorf("project lock left behind: %v", err)
-	}
+	// The project lock must have been released despite the failure. In P1 the
+	// lock FILE persists as an empty placeholder (never unlinked), so
+	// "released" means no active lock, not file absence.
+	assertNoActiveProjectLock(t, dir)
 }
 
+// TestBinary_ProjectLockConflict_Exit3 is a true multi-process test: the
+// parent process holds the OS advisory project lock (flock) while a real
+// ctask subprocess tries to mutate. The kernel enforces mutual exclusion
+// across processes, so the subprocess must exit 3 (LOCK_CONFLICT).
 func TestBinary_ProjectLockConflict_Exit3(t *testing.T) {
 	dir := t.TempDir()
 	if r := runBin(t, dir, "init"); r.code != 0 {
 		t.Fatalf("init failed: exit %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
-	writeProjectLockFixture(t, dir)
+
+	// Parent holds the live flock on .ctask/.ctask.lock.
+	handle, err := store.AcquireProjectLock(store.NewStore(dir), store.ProjectLockOptions{
+		Command: "other-agent",
+		Agent:   "other-agent",
+		TTL:     5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("AcquireProjectLock failed: %v", err)
+	}
+	defer handle.Release()
 
 	r := runBin(t, dir, "add", "Task A")
 	if r.code != 3 {
@@ -189,6 +204,29 @@ func TestBinary_ProjectLockConflict_Exit3(t *testing.T) {
 	if !strings.Contains(r.stderr, "other-agent") {
 		t.Errorf("expected conflict to name the lock holder, got: %q", r.stderr)
 	}
+}
+
+// TestBinary_StaleLockMetadataReclaimed_Exit0 verifies that leftover lock
+// metadata from a crashed process (no live flock holder) does NOT block a
+// mutation: the OS lock is the source of truth, so the metadata is reclaimed
+// and the mutation succeeds.
+func TestBinary_StaleLockMetadataReclaimed_Exit0(t *testing.T) {
+	dir := t.TempDir()
+	if r := runBin(t, dir, "init"); r.code != 0 {
+		t.Fatalf("init failed: exit %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
+	}
+	// Dead-process metadata: no process holds the flock.
+	writeProjectLockFixture(t, dir)
+
+	r := runBin(t, dir, "add", "Task A")
+	if r.code != 0 {
+		t.Errorf("expected exit 0 (stale metadata reclaimed), got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "TASK-001") {
+		t.Errorf("expected the mutation to succeed, got stdout: %q", r.stdout)
+	}
+	// After the mutation the lock is released again: no active lock remains.
+	assertNoActiveProjectLock(t, dir)
 }
 
 func TestBinary_SuccessPath_Exit0(t *testing.T) {
@@ -253,6 +291,9 @@ func TestBinary_CheckStrict_Exit1WithCleanDefer(t *testing.T) {
 	if !hasCmdEvent(events, model.EventCheckPassed) && !hasCmdEvent(events, model.EventCheckFailed) {
 		t.Errorf("expected a check.* event to be appended, got %v", events)
 	}
+	// The project lock must have been released despite the exit-1 failure
+	// (P1: the lock file persists empty; no active lock must remain).
+	assertNoActiveProjectLock(t, dir)
 }
 
 func TestBinary_CheckJSONFailure_ValidEnvelope(t *testing.T) {
@@ -318,11 +359,10 @@ func TestBinary_FinishStrict_Exit1(t *testing.T) {
 		t.Errorf("expected exit 1 for finish --strict with warnings, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
 
-	// The finish sequence must have completed its cleanup: no project lock
-	// left behind, and the session.finished event appended.
-	if _, err := os.Stat(filepath.Join(dir, ".ctask", store.ProjectLockFile)); !os.IsNotExist(err) {
-		t.Errorf("project lock left behind after finish: %v", err)
-	}
+	// The finish sequence must have completed its cleanup: the project lock
+	// released (P1: lock file persists empty - no active lock), and the
+	// session.finished event appended.
+	assertNoActiveProjectLock(t, dir)
 	events, err := s.ReadEvents()
 	if err != nil {
 		t.Fatalf("ReadEvents failed: %v", err)

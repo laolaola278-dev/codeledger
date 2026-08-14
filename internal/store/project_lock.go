@@ -1,36 +1,53 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/gofrs/flock"
+
+	"github.com/codeledger/codeledger/internal/clock"
+	"github.com/codeledger/codeledger/internal/lease"
 	"github.com/codeledger/codeledger/internal/model"
 )
 
-// DefaultProjectLockTTL is the default time-to-live for a project lock.
-// A stale lock older than this TTL is considered expired and can be removed.
+// DefaultProjectLockTTL is the default time-to-live recorded in the project
+// lock metadata. With OS advisory locking the TTL is informational (display
+// and audit); mutual exclusion is enforced by the kernel flock while the
+// acquiring process lives, so a live holder can never be stolen and a dead
+// holder's lock is released automatically by the OS.
 const DefaultProjectLockTTL = 2 * time.Minute
 
 // ProjectLock holds the JSON metadata written to .ctask/.ctask.lock.
+//
+// The file itself is the target of an OS advisory lock (flock(2) on Unix,
+// LockFileEx on Windows) held by the acquiring process for the duration of a
+// mutation. The JSON metadata is informational: it lets `ctask locks` and
+// auditing tools see who holds the lock and when it expires.
 type ProjectLock struct {
 	Pid       int    `json:"pid"`
 	Command   string `json:"command"`
 	Agent     string `json:"agent"`
 	TaskID    string `json:"task_id"`
+	LeaseID   string `json:"lease_id,omitempty"`
 	CreatedAt string `json:"created_at"`
 	ExpiresAt string `json:"expires_at"`
 }
 
 // ProjectLockError is returned when a project lock cannot be acquired because
-// another (non-expired) lock is already held.
+// another live process currently holds the advisory lock.
 type ProjectLockError struct {
 	Lock ProjectLock
 }
 
 func (e *ProjectLockError) Error() string {
+	if e.Lock.Command == "" && e.Lock.Pid == 0 {
+		return "project is locked by another process"
+	}
 	return fmt.Sprintf("project is locked by another process (pid %d, command %q, agent %q, task %q, expires %s)",
 		e.Lock.Pid, e.Lock.Command, e.Lock.Agent, e.Lock.TaskID, e.Lock.ExpiresAt)
 }
@@ -44,46 +61,91 @@ func IsProjectLockConflict(err error) bool {
 // ProjectLockHandle represents a held project lock. Callers must call Release
 // (ideally via defer) once the protected operation completes.
 //
-// It deliberately does NOT hold an open *os.File: the lock file is created,
-// written, synced and closed inside AcquireProjectLock, so on Windows there is
-// no lingering handle that could make os.Remove fail with
-// "being used by another process". The handle only tracks the store, the lock
-// metadata and the released state.
+// The handle owns the OS advisory lock: it keeps the *flock.Flock alive so
+// the kernel holds the exclusive lock until Release (or process exit, which
+// releases it automatically - a crash can never leave a stuck lock).
 type ProjectLockHandle struct {
 	s        *Store
 	lock     ProjectLock
+	fl       *flock.Flock
 	acquired bool
+	// appendEvent is the audit sink for the lock's own lifecycle events
+	// (project.lock_acquired / project.lock_released). It defaults to
+	// Store.AppendEvent and is an instance-level seam (never a global hook)
+	// so deterministic failure tests can inject an audit outage.
+	appendEvent func(evt model.Event) error
 }
 
-// Release removes the project lock file if it is still owned by this handle.
-// It is safe to call multiple times: once released, subsequent calls are no-ops.
+// Release clears the lock metadata, releases the OS advisory lock and closes
+// the file descriptor. It is safe to call multiple times: once the lock is
+// determinately released, subsequent calls are no-ops that never touch a
+// later owner's lock file.
 //
-// Order: the project.lock_released event is written FIRST, then the lock file
-// is removed with a short Windows-friendly retry. If the file is already gone
-// (os.ErrNotExist) the release is still considered successful. The handle is
-// marked released only after the file removal actually succeeds; if removal
-// ultimately fails, an error is returned and the handle stays acquired so the
-// caller can retry (and the error is never silently swallowed).
+// Order: the project.lock_released event is written FIRST, then the metadata
+// is cleared (while the OS lock is still held, so no reader can mistake the
+// stale metadata for an active holder), then the lock is released.
+//
+// A failure in ANY step (audit append, metadata truncate, unlock, close) is
+// collected and reported via errors.Join, but it never short-circuits the
+// remaining cleanup steps: an audit or metadata failure must not leave the
+// OS lock held. See releaseFlock for the exact state rule.
+//
+// The lock FILE is intentionally never unlinked: unlinking a lock file that
+// another process may already have opened creates a classic race where two
+// processes can each hold "the lock" on different inodes. The file persists
+// as an empty placeholder after release, and an empty file means "no active
+// lock" to every reader.
 func (h *ProjectLockHandle) Release() error {
 	if h == nil || !h.acquired {
 		return nil
 	}
 
-	// Record the release event BEFORE removing the lock file so that the
-	// events.jsonl timeline never shows the lock file disappearing before its
-	// project.lock_released event was written. Readers that only observe the
-	// event log (e.g. `ctask locks` or auditing tools) must see a consistent
-	// order: the release is logged first, then the file is actually removed.
+	var errs []error
 	evt := model.NewEvent(model.EventProjectLockReleased, "", "", "project lock released")
-	if err := h.s.AppendEvent(evt); err != nil {
-		return err
+	if err := h.appendEvent(evt); err != nil {
+		errs = append(errs, fmt.Errorf("failed to log project lock release: %w", err))
 	}
 
-	if err := removeWithRetry(h.s.ProjectLockPath()); err != nil {
-		return fmt.Errorf("failed to remove project lock: %w", err)
+	// Cleanup must run even when the audit append failed: releaseFlock
+	// collects (rather than short-circuits on) every subsequent failure.
+	released, err := releaseFlock(h.s, h.fl)
+	if err != nil {
+		errs = append(errs, err)
 	}
-	h.acquired = false
-	return nil
+	h.acquired = !released
+	return errors.Join(errs...)
+}
+
+// releaseFlock best-effort clears the lock metadata and releases the OS
+// advisory lock held by f, continuing through every step regardless of
+// earlier failures. It never touches the audit sink, so it is safe to use on
+// acquisition-failure paths where audit logging itself is broken.
+//
+// It reports whether the OS lock was determinately released.
+//
+// State rule (gofrs/flock v0.12.1): Flock.Unlock() calls flock(LOCK_UN) and,
+// only on success, closes the file descriptor and resets the Flock to the
+// unlocked state (a later Unlock/Close is then a no-op). On failure it
+// returns without resetting, leaving the lock and fd held, so a retry
+// re-attempts LOCK_UN. Flock.Close() is exactly Unlock(), so calling Unlock
+// then Close yields one safe retry and a no-op when Unlock already
+// succeeded. The lock is therefore determinately gone iff at least one of
+// Unlock/Close returned nil; if both fail the outcome is unknown and the
+// handle must remain "acquired" so a later Release retries cleanup.
+func releaseFlock(s *Store, f *flock.Flock) (released bool, err error) {
+	var errs []error
+	if err := truncateProjectLockFile(s.ProjectLockPath()); err != nil {
+		errs = append(errs, fmt.Errorf("failed to clear project lock metadata: %w", err))
+	}
+	unlockErr := f.Unlock()
+	if unlockErr != nil {
+		errs = append(errs, fmt.Errorf("failed to unlock project lock: %w", unlockErr))
+	}
+	closeErr := f.Close()
+	if closeErr != nil {
+		errs = append(errs, fmt.Errorf("failed to close project lock: %w", closeErr))
+	}
+	return unlockErr == nil || closeErr == nil, errors.Join(errs...)
 }
 
 // ProjectLockOptions configures acquisition of a project lock.
@@ -92,138 +154,195 @@ type ProjectLockOptions struct {
 	Agent   string
 	TaskID  string
 	TTL     time.Duration
+	// Clock and NewID are injectable for deterministic tests; nil means
+	// real clock and random IDs.
+	Clock clock.Clock
+	NewID lease.IDGen
+	// AppendEvent overrides the audit sink for the project lock's own
+	// lifecycle events (project.lock_acquired / project.lock_released /
+	// project.lock_conflict / project.lock_stale_removed). It is nil in
+	// production, which means Store.AppendEvent. Tests inject a deterministic
+	// failure here; it is an instance-level seam, never a global hook or an
+	// environment variable.
+	AppendEvent func(evt model.Event) error
 }
 
-// AcquireProjectLock creates .ctask/.ctask.lock atomically using
-// os.OpenFile with O_CREATE|O_EXCL. It returns a handle that must be
-// released (ideally via defer) after the protected operation finishes.
+// AcquireProjectLock acquires the project mutation lock using a real OS
+// advisory lock on .ctask/.ctask.lock (flock(2) on Unix, LockFileEx on
+// Windows, via gofrs/flock). It returns a handle that must be released
+// (ideally via defer) after the protected operation finishes.
+//
+// Return contract: success returns (non-nil handle, nil error); failure
+// returns (nil handle, non-nil error). A held handle is never returned
+// together with an error.
 //
 // Behavior:
-//   - If the lock file does not exist, it is created with JSON metadata and a
-//     project.lock_acquired event is logged.
-//   - If the lock file exists and has NOT expired, a ProjectLockError is
-//     returned and a project.lock_conflict event is logged.
-//   - If the lock file exists but HAS expired, the stale lock is removed, a
-//     project.lock_stale_removed event is logged, and a fresh lock is acquired.
+//   - If no other live process holds the lock, acquisition succeeds
+//     immediately and fresh metadata (including a new lease_id) is written.
+//   - If another live process holds the lock, a ProjectLockError is returned
+//     and a project.lock_conflict event is logged. A live holder is never
+//     stolen, regardless of the recorded expiry: the OS lock is the source of
+//     truth.
+//   - Leftover metadata left by a crashed process (the OS released its lock
+//     automatically) is reclaimed: a project.lock_stale_removed event is
+//     logged and the metadata is overwritten. This also covers corrupt or
+//     unreadable leftover files.
+//   - If the audit append for any of the lock's own lifecycle events fails
+//     after the flock has been taken, the OS resources are released through
+//     the audit-independent releaseFlock path and (nil, error) is returned:
+//     the lock is never leaked into the calling process.
 func AcquireProjectLock(s *Store, opts ProjectLockOptions) (*ProjectLockHandle, error) {
 	if opts.TTL <= 0 {
 		opts.TTL = DefaultProjectLockTTL
 	}
-
-	now := time.Now().UTC()
-	lock := ProjectLock{
-		Pid:       os.Getpid(),
-		Command:   opts.Command,
-		Agent:     opts.Agent,
-		TaskID:    opts.TaskID,
-		CreatedAt: now.Format(time.RFC3339),
-		ExpiresAt: now.Add(opts.TTL).Format(time.RFC3339),
+	clk := opts.Clock
+	if clk == nil {
+		clk = clock.RealClock{}
 	}
-
-	data, err := json.MarshalIndent(lock, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal project lock: %w", err)
+	newID := opts.NewID
+	if newID == nil {
+		newID = lease.RandomID
+	}
+	appendEvent := opts.AppendEvent
+	if appendEvent == nil {
+		appendEvent = s.AppendEvent
 	}
 
 	if err := s.EnsureDir(); err != nil {
 		return nil, fmt.Errorf("failed to ensure .ctask directory: %w", err)
 	}
 
-	f, err := os.OpenFile(s.ProjectLockPath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err == nil {
-		if _, werr := f.Write(append(data, '\n')); werr != nil {
-			f.Close()
-			_ = removeWithRetry(s.ProjectLockPath())
-			return nil, fmt.Errorf("failed to write project lock: %w", werr)
-		}
-		// Sync then close immediately so no open handle is retained. On Windows,
-		// an open file handle can make a later os.Remove fail with
-		// "The process cannot access the file because it is being used by
-		// another process"; closing here guarantees Release can delete the file.
-		_ = f.Sync()
-		if cerr := f.Close(); cerr != nil {
-			_ = removeWithRetry(s.ProjectLockPath())
-			return nil, fmt.Errorf("failed to close project lock: %w", cerr)
-		}
+	f := flock.New(s.ProjectLockPath(),
+		flock.SetFlag(os.O_CREATE|os.O_RDWR),
+		flock.SetPermissions(0o600),
+	)
 
-		evt := model.NewEvent(model.EventProjectLockAcquired, "", "", fmt.Sprintf("project lock acquired for %q (pid %d)", opts.Command, lock.Pid))
-		if aerr := s.AppendEvent(evt); aerr != nil {
-			// The lock is held; report the event failure but keep the lock.
-			return &ProjectLockHandle{s: s, lock: lock, acquired: true}, fmt.Errorf("project lock acquired but failed to log event: %w", aerr)
-		}
-		return &ProjectLockHandle{s: s, lock: lock, acquired: true}, nil
+	locked, err := f.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire project lock: %w", err)
 	}
-
-	if !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("failed to create project lock: %w", err)
-	}
-
-	// Lock file already exists: inspect it.
-	existing, rerr := readProjectLockFile(s)
-	if rerr == nil && !isProjectLockExpired(existing.ExpiresAt) {
+	if !locked {
+		// A live process holds the lock. Read whatever metadata is visible
+		// for a helpful conflict message (best effort).
+		existing, _ := readProjectLockFile(s)
+		lock := ProjectLock{}
+		if existing != nil {
+			lock = *existing
+		}
 		conflictEvt := model.NewEvent(model.EventProjectLockConflict, "", "", fmt.Sprintf(
 			"project lock conflict: held by pid %d (command %q, agent %q, task %q, expires %s)",
-			existing.Pid, existing.Command, existing.Agent, existing.TaskID, existing.ExpiresAt))
-		_ = s.AppendEvent(conflictEvt)
-		return nil, &ProjectLockError{Lock: *existing}
+			lock.Pid, lock.Command, lock.Agent, lock.TaskID, lock.ExpiresAt))
+		_ = appendEvent(conflictEvt)
+		return nil, &ProjectLockError{Lock: lock}
 	}
 
-	if errors.Is(rerr, os.ErrNotExist) {
-		// The lock file vanished between our O_EXCL failure and this read:
-		// a concurrent process removed it. Retry acquisition.
-		return AcquireProjectLock(s, opts)
-	}
-
-	// At this point the existing lock is either expired (stale) or unreadable/corrupt.
-	// Remove it so mutations cannot be blocked forever, then re-acquire.
-	if rerr != nil {
+	// We now hold the OS lock. Any non-empty leftover metadata was left by a
+	// process that died mid-mutation (or a corrupt/garbage file): reclaim it.
+	existing, rerr := readProjectLockFile(s)
+	switch {
+	case rerr == nil && existing != nil:
+		staleEvt := model.NewEvent(model.EventProjectLockStaleRemoved, "", "", fmt.Sprintf(
+			"removed stale project lock from pid %d (command %q, expired %s)",
+			existing.Pid, existing.Command, existing.ExpiresAt))
+		if aerr := appendEvent(staleEvt); aerr != nil {
+			_, cleanupErr := releaseFlock(s, f)
+			return nil, errors.Join(
+				fmt.Errorf("project lock stale removed but failed to log event: %w", aerr),
+				cleanupErr,
+			)
+		}
+	case rerr != nil:
 		staleEvt := model.NewEvent(model.EventProjectLockStaleRemoved, "", "",
 			"removed unreadable/corrupt project lock: "+rerr.Error())
-		if aerr := s.AppendEvent(staleEvt); aerr != nil {
-			return nil, fmt.Errorf("project lock stale removed but failed to log event: %w", aerr)
-		}
-	} else {
-		staleEvt := model.NewEvent(model.EventProjectLockStaleRemoved, "", "", fmt.Sprintf(
-			"removed stale project lock from pid %d (expired %s)", existing.Pid, existing.ExpiresAt))
-		if aerr := s.AppendEvent(staleEvt); aerr != nil {
-			return nil, fmt.Errorf("project lock stale removed but failed to log event: %w", aerr)
+		if aerr := appendEvent(staleEvt); aerr != nil {
+			_, cleanupErr := releaseFlock(s, f)
+			return nil, errors.Join(
+				fmt.Errorf("project lock stale removed but failed to log event: %w", aerr),
+				cleanupErr,
+			)
 		}
 	}
-	if err := removeWithRetry(s.ProjectLockPath()); err != nil {
-		return nil, fmt.Errorf("failed to remove stale project lock: %w", err)
+
+	now := clk.Now().UTC()
+	lock := ProjectLock{
+		Pid:       os.Getpid(),
+		Command:   opts.Command,
+		Agent:     opts.Agent,
+		TaskID:    opts.TaskID,
+		LeaseID:   newID(),
+		CreatedAt: now.Format(time.RFC3339),
+		ExpiresAt: now.Add(opts.TTL).Format(time.RFC3339),
 	}
-	return AcquireProjectLock(s, opts)
+
+	data, err := json.MarshalIndent(lock, "", "  ")
+	if err != nil {
+		_, cleanupErr := releaseFlock(s, f)
+		return nil, errors.Join(fmt.Errorf("failed to marshal project lock: %w", err), cleanupErr)
+	}
+	if err := writeProjectLockFile(s, append(data, '\n')); err != nil {
+		_, cleanupErr := releaseFlock(s, f)
+		return nil, errors.Join(fmt.Errorf("failed to write project lock metadata: %w", err), cleanupErr)
+	}
+
+	// Acquire contract: success returns (non-nil handle, nil error); failure
+	// returns (nil handle, non-nil error). A held handle is never handed to a
+	// caller alongside an error.
+	handle := &ProjectLockHandle{s: s, lock: lock, fl: f, acquired: true, appendEvent: appendEvent}
+	evt := model.NewEvent(model.EventProjectLockAcquired, "", "", fmt.Sprintf(
+		"project lock acquired for %q (pid %d, lease %s)", opts.Command, lock.Pid, lock.LeaseID))
+	if aerr := appendEvent(evt); aerr != nil {
+		// The OS lock is held but the audit append failed. Release the OS
+		// resources through the audit-independent path (never a normal
+		// Release(), which would append another event via the same broken
+		// sink) and return nil handle + combined error.
+		_, cleanupErr := releaseFlock(s, f)
+		return nil, errors.Join(
+			fmt.Errorf("project lock acquired but failed to log event: %w", aerr),
+			cleanupErr,
+		)
+	}
+	return handle, nil
 }
 
-// removeWithRetry removes path, retrying briefly on transient failures.
-//
-// On Windows, os.Remove of a file that was just closed by the same process (or
-// briefly held by an external handle, e.g. an antivirus scanner) can fail with
-// ERROR_SHARING_VIOLATION / "The process cannot access the file because it is
-// being used by another process". Such failures are often transient and vanish
-// within a few milliseconds, so this helper retries with a short backoff
-// (50ms, 100ms, 150ms, 200ms, 250ms) before giving up. A missing file is
-// treated as success (os.ErrNotExist).
-func removeWithRetry(path string) error {
-	var err error
-	for i := 0; i < 5; i++ {
-		err = os.Remove(path)
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
+// writeProjectLockFile truncates and rewrites the lock metadata while the
+// caller holds the OS lock.
+func writeProjectLockFile(s *Store, data []byte) error {
+	f, err := os.OpenFile(s.ProjectLockPath(), os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
 	}
-	return err
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// truncateProjectLockFile clears the lock metadata, leaving an empty file.
+func truncateProjectLockFile(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // readProjectLockFile reads and parses .ctask/.ctask.lock.
+// An empty (released) file returns (nil, nil): no active lock.
 func readProjectLockFile(s *Store) (*ProjectLock, error) {
 	data, err := os.ReadFile(s.ProjectLockPath())
 	if err != nil {
 		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, nil
 	}
 	var lock ProjectLock
 	if err := json.Unmarshal(data, &lock); err != nil {
@@ -232,21 +351,10 @@ func readProjectLockFile(s *Store) (*ProjectLock, error) {
 	return &lock, nil
 }
 
-// isProjectLockExpired returns true when the expires_at timestamp is in the past.
-// A missing or unparseable expires_at is treated as expired (safe to reclaim).
-func isProjectLockExpired(expiresAt string) bool {
-	if expiresAt == "" {
-		return true
-	}
-	t, err := time.Parse(time.RFC3339, expiresAt)
-	if err != nil {
-		return true
-	}
-	return time.Now().UTC().After(t)
-}
-
-// ReadProjectLock reads the current project lock, if any.
-// It returns nil when no lock file exists.
+// ReadProjectLock reads the current project lock metadata, if any.
+// It returns nil when there is no lock file or the file is empty (released).
+// Corrupt non-empty files surface an error (they are reclaimed on next
+// acquisition).
 func ReadProjectLock(s *Store) (*ProjectLock, error) {
 	lock, err := readProjectLockFile(s)
 	if err != nil {

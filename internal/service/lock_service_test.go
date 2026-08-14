@@ -1,11 +1,14 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/codeledger/codeledger/internal/clock"
+	"github.com/codeledger/codeledger/internal/lease"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
 )
@@ -44,7 +47,7 @@ func TestNextTask_PriorityHighBeforeMedium(t *testing.T) {
 	addTestTask(t, s, "Medium priority task", model.PriorityMedium, nil)
 	addTestTask(t, s, "High priority task", model.PriorityHigh, nil)
 
-	result, err := NextTask(s, "")
+	result, err := NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -66,7 +69,7 @@ func TestNextTask_DependsOnNotDone(t *testing.T) {
 
 	// Task B depends on Task A, which is not done yet.
 	// Only Task A should be available.
-	result, err := NextTask(s, "")
+	result, err := NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -86,7 +89,8 @@ func TestNextTask_LockedTaskNotReturned(t *testing.T) {
 	taskA := addTestTask(t, s, "Task A", model.PriorityHigh, nil)
 	addTestTask(t, s, "Task B", model.PriorityMedium, nil)
 
-	// Manually add a lock for Task A
+	// Manually add a lock for Task A. Legacy pre-lease locks (no lease_id /
+	// lease_duration) that have not expired also block the task fail-closed.
 	future := time.Now().Add(2 * time.Hour).Format(time.RFC3339)
 	lock := model.Lock{
 		TaskID:      taskA.ID,
@@ -106,7 +110,7 @@ func TestNextTask_LockedTaskNotReturned(t *testing.T) {
 	}
 
 	// Task A is locked, so Task B should be next
-	result, err := NextTask(s, "")
+	result, err := NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -119,14 +123,18 @@ func TestNextTask_LockedTaskNotReturned(t *testing.T) {
 }
 
 // TestClaimTask_SetsInProgress verifies that claiming a task changes its
-// status from pending to in_progress.
+// status from pending to in_progress and records a lease with a lease_id.
 func TestClaimTask_SetsInProgress(t *testing.T) {
 	s, _ := setupTestStore(t)
 
 	task := addTestTask(t, s, "Claimable task", model.PriorityHigh, nil)
 
-	if err := ClaimTask(s, task.ID, "test-agent", "developer", "120m"); err != nil {
+	lock, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m")
+	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
+	}
+	if lock.LeaseID == "" {
+		t.Error("expected a lease_id on the claimed lock")
 	}
 
 	// Verify task status is in_progress
@@ -162,11 +170,11 @@ func TestReleaseTask_ResetsToPending(t *testing.T) {
 
 	task := addTestTask(t, s, "Releasable task", model.PriorityHigh, nil)
 
-	if err := ClaimTask(s, task.ID, "test-agent", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
-	if err := ReleaseTask(s, task.ID, "test-agent"); err != nil {
+	if err := ReleaseTask(s, clock.RealClock{}, task.ID, "test-agent", "", false, ""); err != nil {
 		t.Fatalf("ReleaseTask failed: %v", err)
 	}
 
@@ -218,7 +226,7 @@ func TestClaimTask_ExpiredLockDoesNotBlock(t *testing.T) {
 	}
 
 	// Claim should succeed despite the expired lock
-	if err := ClaimTask(s, task.ID, "new-agent", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "new-agent", "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask should succeed with expired lock, but got: %v", err)
 	}
 
@@ -240,21 +248,24 @@ func TestClaimTask_ExpiredLockDoesNotBlock(t *testing.T) {
 }
 
 // TestClaimTask_AlreadyLocked verifies that claiming a task with an active
-// lock returns an error.
+// lease returns a lease conflict error.
 func TestClaimTask_AlreadyLocked(t *testing.T) {
 	s, _ := setupTestStore(t)
 
 	task := addTestTask(t, s, "Locked task", model.PriorityHigh, nil)
 
 	// First claim succeeds
-	if err := ClaimTask(s, task.ID, "agent1", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "agent1", "developer", "120m"); err != nil {
 		t.Fatalf("first ClaimTask failed: %v", err)
 	}
 
 	// Second claim should fail
-	err := ClaimTask(s, task.ID, "agent2", "developer", "120m")
+	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "agent2", "developer", "120m")
 	if err == nil {
 		t.Fatal("expected error when claiming an already locked task")
+	}
+	if !errors.Is(err, ErrLeaseConflict) {
+		t.Errorf("expected ErrLeaseConflict, got: %v", err)
 	}
 }
 
@@ -263,7 +274,7 @@ func TestClaimTask_AlreadyLocked(t *testing.T) {
 func TestNextTask_NoAvailableTasks(t *testing.T) {
 	s, _ := setupTestStore(t)
 
-	result, err := NextTask(s, "")
+	result, err := NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -281,14 +292,14 @@ func TestHeartbeatTask(t *testing.T) {
 
 	task := addTestTask(t, s, "Heartbeat task", model.PriorityHigh, nil)
 
-	if err := ClaimTask(s, task.ID, "test-agent", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
 	// Small delay to ensure timestamp changes
 	time.Sleep(1100 * time.Millisecond)
 
-	if err := HeartbeatTask(s, task.ID, "test-agent"); err != nil {
+	if _, err := HeartbeatTask(s, clock.RealClock{}, task.ID, "test-agent", ""); err != nil {
 		t.Fatalf("HeartbeatTask failed: %v", err)
 	}
 
@@ -313,9 +324,12 @@ func TestReleaseTask_NoLock(t *testing.T) {
 
 	task := addTestTask(t, s, "No lock task", model.PriorityHigh, nil)
 
-	err := ReleaseTask(s, task.ID, "")
+	err := ReleaseTask(s, clock.RealClock{}, task.ID, "", "", false, "")
 	if err == nil {
 		t.Fatal("expected error when releasing a task with no lock")
+	}
+	if !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("expected ErrLeaseNotFound, got: %v", err)
 	}
 }
 
@@ -324,11 +338,11 @@ func TestClaimTask_DoneTaskFails(t *testing.T) {
 	s, _ := setupTestStore(t)
 
 	task := addTestTask(t, s, "Done task", model.PriorityHigh, nil)
-	if err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", false, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
-	err := ClaimTask(s, task.ID, "test-agent", "developer", "120m")
+	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m")
 	if err == nil {
 		t.Fatal("expected error when claiming a done task")
 	}
@@ -343,7 +357,7 @@ func TestClaimTask_BlockedTaskFails(t *testing.T) {
 		t.Fatalf("BlockTask failed: %v", err)
 	}
 
-	err := ClaimTask(s, task.ID, "test-agent", "developer", "120m")
+	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m")
 	if err == nil {
 		t.Fatal("expected error when claiming a blocked task")
 	}
@@ -359,7 +373,7 @@ func TestNextTask_PriorityOrdering(t *testing.T) {
 	addTestTask(t, s, "High priority task", model.PriorityHigh, nil)
 
 	// High priority should be first
-	result, err := NextTask(s, "")
+	result, err := NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -368,10 +382,10 @@ func TestNextTask_PriorityOrdering(t *testing.T) {
 	}
 
 	// Complete high priority, medium should be next
-	if err := CompleteTask(s, result.Task.ID, "", "", model.TestResultPassed, "", false, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, result.Task.ID, CompleteOptions{Result: model.TestResultPassed}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
-	result, err = NextTask(s, "")
+	result, err = NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -390,7 +404,7 @@ func TestNextTask_DependsOnChain(t *testing.T) {
 	addTestTask(t, s, "Task C", model.PriorityLow, []string{taskB.ID})
 
 	// Only Task A should be available
-	result, err := NextTask(s, "")
+	result, err := NextTask(s, "", clock.RealClock{})
 	if err != nil {
 		t.Fatalf("NextTask failed: %v", err)
 	}
@@ -427,7 +441,7 @@ func TestExpiredLockCleanedOnClaim(t *testing.T) {
 	}
 
 	// Claim Task A (this should clean expired locks)
-	if err := ClaimTask(s, taskA.ID, "agent1", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, taskA.ID, "agent1", "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 

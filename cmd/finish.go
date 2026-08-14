@@ -83,7 +83,7 @@ Flags:
 		// error is acted upon, so a strict-mode failure propagates as a
 		// typed error instead of os.Exit.
 		return withProjectLock(deps, s, "finish", o.agent, o.task, func() error {
-			return runFinish(cmd, s, o)
+			return runFinish(cmd, deps, s, o)
 		})
 	}
 
@@ -105,7 +105,7 @@ Flags:
 // runFinish executes the finish sequence while the project mutation lock is
 // held. All failures are returned as typed errors; no os.Exit is used, so
 // deferred cleanup (including project lock release) always runs first.
-func runFinish(cmd *cobra.Command, s *store.Store, o *finishOptions) error {
+func runFinish(cmd *cobra.Command, deps Dependencies, s *store.Store, o *finishOptions) error {
 	out := cmd.OutOrStdout()
 	var jsonOut finishJSONOutput
 	var jsonErrors []string
@@ -119,7 +119,7 @@ func runFinish(cmd *cobra.Command, s *store.Store, o *finishOptions) error {
 	if !o.json {
 		fmt.Fprintln(out, "[1/5] Running consistency check...")
 	}
-	result := service.RunCheck(s)
+	result := service.RunCheck(s, deps.Clock)
 	jsonOut.Check = result
 
 	hasCheckIssues := result.HasFailures()
@@ -159,7 +159,16 @@ func runFinish(cmd *cobra.Command, s *store.Store, o *finishOptions) error {
 			if !o.json {
 				fmt.Fprintf(out, "[2/5] Completing task %s...\n", o.task)
 			}
-			if err := service.CompleteTask(s, o.task, o.files, o.test, o.result, o.note, o.autoFiles, o.captureDiff); err != nil {
+			opts := service.CompleteOptions{
+				Files:       o.files,
+				Test:        o.test,
+				Result:      o.result,
+				Note:        o.note,
+				AutoFiles:   o.autoFiles,
+				CaptureDiff: o.captureDiff,
+				Agent:       o.agent,
+			}
+			if err := service.CompleteTask(s, deps.Clock, o.task, opts); err != nil {
 				if o.json {
 					jsonErrors = append(jsonErrors, fmt.Sprintf("failed to complete task %s: %v", o.task, err))
 				} else {

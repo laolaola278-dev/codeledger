@@ -48,6 +48,19 @@ This document is for AI coding agents. Follow these instructions when working on
 - **Do** update task status before switching to a different task.
 - **Do** record all modified files when completing a task.
 
+## Task Leases and Project Lock (P1)
+
+CodeLedger serializes concurrent mutations with a real OS advisory project lock (`.ctask/.ctask.lock`, via `gofrs/flock`), and tracks task ownership with leases:
+
+- `ctask claim <TASK-ID> --agent <name>` creates a lease with a unique `lease_id` and a TTL (default `120m`, `--ttl` to override). The task is set to `in_progress`.
+- Keep a lease alive while working: `ctask heartbeat <TASK-ID> --agent <name>` renews it by the **full lease duration** (a true renewal).
+- When finished, release it: `ctask release <TASK-ID> --agent <name>`. `ctask done` also releases the lease automatically when you pass `--agent`.
+- Only the lease **owner** can renew or release an active lease. To break another agent's lease, pass `--force` with an explicit `--reason` (audited via a `task.lease_broken` event).
+- **Expired** leases are stale and can be cleaned by anyone without force.
+- **Legacy locks** (pre-lease format, no `lease_id`) are **fail-closed**: they block claims and require `--force --reason` to remove. Run `ctask locks` to inspect, and `ctask check` surfaces legacy locks as warnings.
+
+Concurrency contract: every mutating command (`add`, `claim`, `release`, `heartbeat`, `done`, `block`, `note`, `start`, `finish`, `evidence add`, `plan save`) holds the project lock for the duration of the mutation; a conflicting process fails fast with exit code 3 and a `LOCK_CONFLICT` message. Read-only commands (`status`, `next`, `locks`, `check`, `context`, `report`, ...) never take the project lock.
+
 ## Why This Matters
 
 Following these rules ensures that:
@@ -68,8 +81,10 @@ ctask claim TASK-001 --agent codex # Lock and begin working
 
 # During work
 ctask note TASK-001 "found something important"
+ctask heartbeat TASK-001 --agent codex   # renew the lease while working
 
 # After work
+ctask release TASK-001 --agent codex   # release the lease (done also releases it)
 ctask changed                 # List changed files
 ctask diff --stat              # Diffstat summary
 ctask done TASK-001 --files "..." --auto-files --capture-diff --test "..." --result passed --note "..."

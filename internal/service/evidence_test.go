@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codeledger/codeledger/internal/clock"
+	"github.com/codeledger/codeledger/internal/lease"
 	"github.com/codeledger/codeledger/internal/model"
 )
 
@@ -14,10 +16,16 @@ func TestCompleteTaskAutoReleasesLockAndRecordsEvidence(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Done lock task", model.PriorityHigh, nil)
 
-	if err := ClaimTask(s, task.ID, "agent1", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "agent1", "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
-	if err := CompleteTask(s, task.ID, "main.go", "go test ./...", model.TestResultPassed, "completed", false, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{
+		Files:  "main.go",
+		Test:   "go test ./...",
+		Result: model.TestResultPassed,
+		Note:   "completed",
+		Agent:  "agent1",
+	}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
@@ -56,7 +64,12 @@ func TestCompleteTaskRecordsEvidenceFile(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Evidence task", model.PriorityMedium, nil)
 
-	if err := CompleteTask(s, task.ID, "main.go,main_test.go", "go test ./...", model.TestResultPassed, "finished", false, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{
+		Files:  "main.go,main_test.go",
+		Test:   "go test ./...",
+		Result: model.TestResultPassed,
+		Note:   "finished",
+	}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
@@ -99,7 +112,7 @@ func TestCompleteTaskAutoDetectsGitChangedFiles(t *testing.T) {
 	}
 
 	task := addTestTask(t, s, "Git task", model.PriorityHigh, nil)
-	if err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", true, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed, AutoFiles: true}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 

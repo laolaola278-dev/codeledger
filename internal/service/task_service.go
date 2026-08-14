@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
+	"github.com/codeledger/codeledger/internal/clock"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
 	"github.com/codeledger/codeledger/internal/util"
@@ -117,12 +119,40 @@ func StartTask(s *store.Store, taskID string) error {
 	return s.AppendEvent(evt)
 }
 
+// CompleteOptions carries the optional metadata for CompleteTask.
+type CompleteOptions struct {
+	Files       string
+	Test        string
+	Result      string
+	Note        string
+	AutoFiles   bool
+	CaptureDiff bool
+	// Agent is the completing agent. When the task has an active lease, the
+	// lease owner must match Agent (strict owner validation), or Force must
+	// be set with an explicit Reason.
+	Agent  string
+	Force  bool
+	Reason string
+}
+
 // CompleteTask marks a task as done with optional metadata.
 // If autoFiles is true, changed files are detected from Git and merged
 // with any explicitly provided --files (deduplicated).
 // If captureDiff is true, the full Git diff is saved to a separate .diff
 // evidence file and the path is added to Task.Evidence.
-func CompleteTask(s *store.Store, taskID, files, testCmd, testResult, note string, autoFiles bool, captureDiff bool) error {
+//
+// Lease contract: completion of a task with an active lease requires the
+// lease owner (opts.Agent), or --force --reason to break the lease. Legacy
+// locks are fail-closed: they require --force --reason too. Expired leases
+// are stale and are cleaned without ownership proof.
+func CompleteTask(s *store.Store, clk clock.Clock, taskID string, opts CompleteOptions) error {
+	// Validate the lease BEFORE doing any completion work so a blocked
+	// completion never leaves partial state (evidence, status, events).
+	hasLease, broken, err := completionLeaseGate(s, clk, taskID, opts.Agent, opts.Force, opts.Reason)
+	if err != nil {
+		return err
+	}
+
 	tl, err := s.ReadTasks()
 	if err != nil {
 		return err
@@ -137,33 +167,33 @@ func CompleteTask(s *store.Store, taskID, files, testCmd, testResult, note strin
 		return fmt.Errorf("task %s is already completed", taskID)
 	}
 
-	if testResult != "" && !model.IsValidTestResult(testResult) {
-		return fmt.Errorf("invalid test result: %s (must be passed, failed, skipped, or unknown)", testResult)
+	if opts.Result != "" && !model.IsValidTestResult(opts.Result) {
+		return fmt.Errorf("invalid test result: %s (must be passed, failed, skipped, or unknown)", opts.Result)
 	}
 
-	now := util.NowRFC3339()
+	now := clk.Now().UTC().Format(time.RFC3339)
 	task.Status = model.StatusDone
 	task.UpdatedAt = now
 	task.CompletedAt = now
 
 	// Collect files: preserve existing, add explicit --files
 	fileSet := append([]string{}, task.Files...)
-	if files != "" {
-		fileSet = append(fileSet, util.SplitCommas(files)...)
+	if opts.Files != "" {
+		fileSet = append(fileSet, util.SplitCommas(opts.Files)...)
 	}
 
 	gitDir := filepath.Dir(s.BasePath)
 
 	// Scan git for evidence metadata (only if needed)
 	var gitEv *GitEvidence
-	if autoFiles || captureDiff {
+	if opts.AutoFiles || opts.CaptureDiff {
 		gitEv = scanGitProject(gitDir)
 	} else {
 		gitEv = &GitEvidence{Error: "not captured"}
 	}
 
 	// Auto-detect changed files from Git and merge with dedup
-	if autoFiles {
+	if opts.AutoFiles {
 		if gitEv.Error != "" {
 			return fmt.Errorf("--auto-files requires a git repository")
 		}
@@ -171,22 +201,22 @@ func CompleteTask(s *store.Store, taskID, files, testCmd, testResult, note strin
 	}
 	task.Files = dedupStrings(fileSet)
 
-	if testCmd != "" {
-		task.Test.Command = testCmd
+	if opts.Test != "" {
+		task.Test.Command = opts.Test
 	}
-	if testResult != "" {
-		task.Test.Result = testResult
+	if opts.Result != "" {
+		task.Test.Result = opts.Result
 	}
 
-	if note != "" {
+	if opts.Note != "" {
 		if task.Notes != "" {
-			task.Notes += "\n" + note
+			task.Notes += "\n" + opts.Note
 		} else {
-			task.Notes = note
+			task.Notes = opts.Note
 		}
 	}
 
-	if !captureDiff {
+	if !opts.CaptureDiff {
 		gitEv.Diff = ""
 		gitEv.DiffStat = ""
 	}
@@ -195,7 +225,7 @@ func CompleteTask(s *store.Store, taskID, files, testCmd, testResult, note strin
 	evidencePaths := []string{s.EvidenceRelPath(taskID)}
 
 	// Capture diff to separate .diff file
-	if captureDiff {
+	if opts.CaptureDiff {
 		if gitEv.Error != "" {
 			return fmt.Errorf("--capture-diff requires a git repository")
 		}
@@ -236,13 +266,93 @@ func CompleteTask(s *store.Store, taskID, files, testCmd, testResult, note strin
 		return err
 	}
 
-	evt := model.NewEvent(model.EventTaskCompleted, taskID, task.Title, note)
+	evt := model.NewEvent(model.EventTaskCompleted, taskID, task.Title, opts.Note)
 	if err := s.AppendEvent(evt); err != nil {
 		return err
 	}
 
-	// Auto-release lock if task was claimed
-	return releaseLockIfClaimed(s, taskID)
+	// Auto-release lease if the task was claimed.
+	if hasLease {
+		if err := removeLease(s, taskID); err != nil {
+			return err
+		}
+		if broken {
+			brokenEvt := model.NewEvent(model.EventTaskLeaseBroken, taskID, task.Title, opts.Reason)
+			brokenEvt.Agent = opts.Agent
+			return s.AppendEvent(brokenEvt)
+		}
+		releasedEvt := model.NewEvent(model.EventLockReleasedOnDone, taskID, "", "")
+		if err := s.AppendEvent(releasedEvt); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// completionLeaseGate validates the lease on a task before completion.
+//
+// Return values:
+//   - hasLease: the task currently has a lock entry that must be removed;
+//   - broken: the lease was force-broken (requires a task.lease_broken event);
+//   - err: the completion is blocked (LEASE_CONFLICT / LEASE_EXPIRED /
+//     LEGACY_STATE / FORCE_REQUIRED).
+func completionLeaseGate(s *store.Store, clk clock.Clock, taskID, agent string, force bool, reason string) (hasLease, broken bool, err error) {
+	if force && reason == "" {
+		return false, false, fmt.Errorf("%w: --force requires --reason", ErrForceRequired)
+	}
+
+	locks, err := s.ReadLocks()
+	if err != nil {
+		return false, false, err
+	}
+
+	now := clk.Now()
+	for i := range locks.Locks {
+		l := &locks.Locks[i]
+		if l.TaskID != taskID {
+			continue
+		}
+		switch {
+		case l.Legacy():
+			if !force {
+				return true, false, fmt.Errorf("%w: task %s has a legacy lock from %s; pass --force --reason to complete it",
+					ErrLegacyState, taskID, l.Agent)
+			}
+			return true, true, nil
+		case l.ExpiredAt(now):
+			// Stale lease: clean it on completion, no ownership proof needed.
+			return true, false, nil
+		case agent == "":
+			return true, false, fmt.Errorf("%w: task %s is leased by %s; pass --agent %s (or --force --reason)",
+				ErrLeaseConflict, taskID, l.Agent, l.Agent)
+		case l.Agent != agent:
+			if !force {
+				return true, false, fmt.Errorf("%w: task %s is leased by %s, not %s (use --force --reason)",
+					ErrLeaseConflict, taskID, l.Agent, agent)
+			}
+			return true, true, nil
+		default:
+			return true, false, nil
+		}
+	}
+	return false, false, nil
+}
+
+// removeLease removes any lock entry for the given task.
+func removeLease(s *store.Store, taskID string) error {
+	locks, err := s.ReadLocks()
+	if err != nil {
+		return err
+	}
+	var active []model.Lock
+	for _, l := range locks.Locks {
+		if l.TaskID != taskID {
+			active = append(active, l)
+		}
+	}
+	locks.Locks = active
+	return s.WriteLocks(locks)
 }
 
 // BlockTask sets a task's status to blocked with a reason.
@@ -482,34 +592,4 @@ func GetTestResults(s *store.Store) ([]model.Task, error) {
 	}
 
 	return results, nil
-}
-
-// releaseLockIfClaimed removes any active lock for the given task and logs an event.
-func releaseLockIfClaimed(s *store.Store, taskID string) error {
-	locks, err := s.ReadLocks()
-	if err != nil {
-		return nil
-	}
-
-	found := false
-	var active []model.Lock
-	for _, l := range locks.Locks {
-		if l.TaskID == taskID {
-			found = true
-			continue
-		}
-		active = append(active, l)
-	}
-	locks.Locks = active
-
-	if !found {
-		return nil
-	}
-
-	if err := s.WriteLocks(locks); err != nil {
-		return err
-	}
-
-	evt := model.NewEvent(model.EventLockReleasedOnDone, taskID, "", "")
-	return s.AppendEvent(evt)
 }

@@ -87,11 +87,11 @@ ctask report
 | `ctask add <title>` | Add a new task (--priority, --depends) |
 | `ctask list` | List all tasks (filter with `--status`) |
 | `ctask next` | Show the next suggested task to work on |
-| `ctask claim <task-id>` | Lock a task and mark as in_progress (--agent, --role, --ttl) |
-| `ctask release <task-id>` | Release a locked task back to pending |
-| `ctask heartbeat <task-id>` | Refresh the TTL on a claimed task lock |
+| `ctask claim <task-id>` | Claim a task: create a lease and mark in_progress (--agent required, --role, --ttl) |
+| `ctask release <task-id>` | Release a task's lease back to pending (--agent, --lease-id; --force --reason to break another's lease) |
+| `ctask heartbeat <task-id>` | Renew a task's lease by the full lease duration (--agent, --lease-id) |
 | `ctask start <task-id>` | Mark a task as in progress (no lock) |
-| `ctask done <task-id>` | Mark a task as completed (--files, --auto-files, --capture-diff, --test, --result, --note) |
+| `ctask done <task-id>` | Mark a task as completed (--files, --auto-files, --capture-diff, --test, --result, --note, --agent, --force, --reason) |
 | `ctask block <task-id> <reason>` | Mark a task as blocked |
 | `ctask note <task-id> <note>` | Add a note to a task |
 | `ctask changed` | List files changed in the Git working tree |
@@ -124,6 +124,44 @@ ctask report
 ```
 
 All files are plain text (YAML, JSONL, Markdown). They are human-readable, agent-friendly, and Git-friendly.
+
+## Task Leases and Locking (P1)
+
+CodeLedger uses two layers of protection so concurrent agents cannot corrupt `.ctask/` state or work on the same task at the same time.
+
+### Project mutation lock
+
+Every mutating command (`add`, `claim`, `release`, `heartbeat`, `done`, `block`, `note`, `start`, `finish`, `evidence add`, `plan save`) first acquires a **real OS advisory lock** on `.ctask/.ctask.lock` (`flock(2)` on Unix, `LockFileEx` on Windows, via `gofrs/flock`). The kernel enforces mutual exclusion:
+
+- A live holder is **never stolen**, regardless of recorded expiry.
+- A crash releases the lock automatically (the OS cleans up on process death); leftover metadata is reclaimed on the next mutation.
+- The lock file persists as an empty placeholder after release (it is never unlinked, to avoid the classic unlink race). An empty file means "no active lock".
+- A conflicting mutation fails fast with exit code 3 and a `LOCK_CONFLICT` error naming the current holder.
+
+### Task leases
+
+`ctask claim <task-id> --agent <name>` creates a **lease**: a unique `lease_id`, a recorded `lease_duration`, and an `expires_at` of now + TTL. `ctask heartbeat` is a **true renewal** - it extends `expires_at` by the full recorded duration, not just stamps it. Lease contract:
+
+- Only the lease **owner** (matching `--agent`, and `--lease-id` when given) can renew or release an active lease.
+- Breaking another agent's lease requires `--force` with an explicit `--reason` (audited via a `task.lease_broken` event).
+- An **expired** lease is stale and can be cleaned by anyone without force.
+- **Legacy locks** (pre-P1 format: no `lease_id` / `lease_duration`, or unparseable fields) are **fail-closed**: they block claims and cannot be renewed or released without `--force --reason`. `ctask check` surfaces them as a warning.
+- `ctask done` on a leased task requires the owner (or `--force --reason`); a successful completion auto-releases the lease.
+
+### Stable exit codes
+
+Errors are classified by typed machine codes (never by string matching) and map to stable process exit codes:
+
+| Exit | Meaning | Machine codes |
+|------|---------|---------------|
+| 0 | success | - |
+| 1 | business / check / legacy-state failure | `NOT_INITIALIZED`, `NOT_FOUND`, `CHECK_FAILED`, `OPERATION_FAILED`, `LEGACY_STATE`, `INTERNAL_ERROR` |
+| 2 | usage / validation failure | `USAGE_ERROR`, `VALIDATION_ERROR`, `FORCE_REQUIRED`, invalid `--ttl` |
+| 3 | contention / precondition | `LOCK_CONFLICT`, `LEASE_CONFLICT`, `LEASE_EXPIRED` |
+
+Commands with `--json` output a single JSON document; on failure that document is an error envelope with `ok=false`, `error.code`, and `error.message` on stdout. Text-mode errors are printed exactly once on stderr.
+
+See [docs/adr/0001-p1-project-mutation-lock-and-task-lease.md](docs/adr/0001-p1-project-mutation-lock-and-task-lease.md) for the full design.
 
 ## AI-Assisted Planning (Phase 6)
 
@@ -197,7 +235,7 @@ Not included in this release:
 ## Roadmap
 
 - **MVP (done):** `init`, `add`, `list`, `start`, `done`, `block`, `note`, `status`, `context`, `report`.
-- **Phase 1 (done):** `next`, `claim`, `release`, `heartbeat`, `done` with lock release, `.ctask/locks.yaml`.
+- **Phase 1 (done):** `next`, `claim`, `release`, `heartbeat`, `done` with lock release, `.ctask/locks.yaml`, task leases, and the OS-advisory project mutation lock (P1 hardening).
 - **Phase 2.1 (done):** `changed`, `diff`, `evidence` add/list/show, `done --auto-files`, `done --capture-diff`, Git evidence capture.
 - **Phase 3 (done):** `check` (26 rules, --json, --strict, --verbose), `finish` (5-step session end sequence).
 - **Phase 4 (planned):** Editor integrations (VS Code, Cursor rules, Claude Code commands).

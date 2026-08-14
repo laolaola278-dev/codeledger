@@ -43,7 +43,7 @@ Exit code 0 if no failures (or no warnings in --strict mode), 1 otherwise.`)
 			return err
 		}
 
-		result := service.RunCheck(s)
+		result := service.RunCheck(s, deps.Clock)
 
 		// Log event
 		var evtType string

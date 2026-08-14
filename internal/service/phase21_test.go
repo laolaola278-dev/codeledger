@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codeledger/codeledger/internal/clock"
 	"github.com/codeledger/codeledger/internal/model"
 )
 
@@ -24,7 +25,7 @@ func TestCompleteTask_AutoFilesMergesWithExplicitFiles(t *testing.T) {
 	os.WriteFile(feature, []byte("package main\n"), 0644)
 
 	task := addTestTask(t, s, "Merge files task", model.PriorityHigh, nil)
-	if err := CompleteTask(s, task.ID, "feature.go,other.go", "", model.TestResultPassed, "", true, false); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Files: "feature.go,other.go", Result: model.TestResultPassed, AutoFiles: true}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
@@ -68,7 +69,7 @@ func TestCompleteTask_CaptureDiff_CreatesDiffFile(t *testing.T) {
 	os.WriteFile(feature, []byte("new content\n"), 0644)
 
 	task := addTestTask(t, s, "Capture diff task", model.PriorityHigh, nil)
-	if err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", false, true); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed, CaptureDiff: true}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
@@ -124,7 +125,7 @@ func TestCompleteTask_CaptureDiff_EmptyDiff(t *testing.T) {
 	runGitQuiet(t, dir, "-c", "user.name=Test", "-c", "user.email=test@codeledger.local", "commit", "--allow-empty", "-m", "init")
 
 	task := addTestTask(t, s, "Empty diff task", model.PriorityHigh, nil)
-	if err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", false, true); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed, CaptureDiff: true}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
@@ -153,7 +154,7 @@ func TestCompleteTask_EvidenceMdDoesNotContainFullDiff(t *testing.T) {
 	os.WriteFile(feature, []byte("new\n"), 0644)
 
 	task := addTestTask(t, s, "No full diff in md task", model.PriorityHigh, nil)
-	if err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", false, true); err != nil {
+	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed, CaptureDiff: true}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
@@ -250,7 +251,7 @@ func TestCompleteTask_LogsFilesAttachedEvent(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Files attached task", model.PriorityHigh, nil)
 
-	CompleteTask(s, task.ID, "main.go,util.go", "", model.TestResultPassed, "", false, false)
+	_ = CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Files: "main.go,util.go", Result: model.TestResultPassed})
 
 	events, err := s.ReadEvents()
 	if err != nil {
@@ -265,7 +266,7 @@ func TestCompleteTask_AutoFilesNotGitRepo(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Non-git auto-files", model.PriorityHigh, nil)
 
-	err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", true, false)
+	err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed, AutoFiles: true})
 	if err == nil {
 		t.Fatal("expected error for --auto-files in non-git repo")
 	}
@@ -280,7 +281,7 @@ func TestCompleteTask_CaptureDiffNotGitRepo(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Non-git capture-diff", model.PriorityHigh, nil)
 
-	err := CompleteTask(s, task.ID, "", "", model.TestResultPassed, "", false, true)
+	err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{Result: model.TestResultPassed, CaptureDiff: true})
 	if err == nil {
 		t.Fatal("expected error for --capture-diff in non-git repo")
 	}

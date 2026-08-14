@@ -65,7 +65,7 @@ func TestAcquireProjectLock_CreatesLockFile(t *testing.T) {
 	}
 }
 
-func TestReleaseProjectLock_RemovesLockFile(t *testing.T) {
+func TestReleaseProjectLock_EmptiesLockFile(t *testing.T) {
 	s := setupProjectLockStore(t)
 
 	h, err := AcquireProjectLock(s, ProjectLockOptions{Command: "done", TTL: time.Minute})
@@ -77,9 +77,28 @@ func TestReleaseProjectLock_RemovesLockFile(t *testing.T) {
 		t.Fatalf("Release failed: %v", err)
 	}
 
-	if _, err := os.Stat(s.ProjectLockPath()); !os.IsNotExist(err) {
-		t.Errorf("lock file still exists after release: %v", err)
+	// The lock FILE is intentionally never unlinked (unlink would race with a
+	// process that already opened it). It must exist but be empty, which is
+	// the "no active lock" state for every reader.
+	data, err := os.ReadFile(s.ProjectLockPath())
+	if err != nil {
+		t.Fatalf("lock file missing after release: %v", err)
 	}
+	if len(strings.TrimSpace(string(data))) != 0 {
+		t.Errorf("lock file not emptied after release: %q", string(data))
+	}
+
+	// ReadProjectLock reports no active lock for an empty file.
+	if lock, err := ReadProjectLock(s); err != nil || lock != nil {
+		t.Errorf("expected nil lock for empty file, got %+v (err=%v)", lock, err)
+	}
+
+	// The advisory lock is actually released: a re-acquire succeeds.
+	h2, err := AcquireProjectLock(s, ProjectLockOptions{Command: "done", TTL: time.Minute})
+	if err != nil {
+		t.Fatalf("re-acquire after release failed: %v", err)
+	}
+	_ = h2.Release()
 
 	// Lock released event was recorded.
 	events, _ := s.ReadEvents()
@@ -126,18 +145,21 @@ func TestAcquireProjectLock_ActiveLockConflicts(t *testing.T) {
 	}
 }
 
-func TestAcquireProjectLock_ExpiredLockRemovedAndReacquired(t *testing.T) {
+func TestAcquireProjectLock_StaleLeftoverReclaimed(t *testing.T) {
 	s := setupProjectLockStore(t)
 
-	h1, err := AcquireProjectLock(s, ProjectLockOptions{Command: "add", TTL: time.Minute})
-	if err != nil {
-		t.Fatalf("first acquire failed: %v", err)
+	// The fixture is written by a dead process, so the .ctask dir must be
+	// created manually here (AcquireProjectLock would create it itself).
+	if err := os.MkdirAll(s.BasePath, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	// Simulate a crashed process that never released the lock:
-	// rewrite the lock file with an already-expired expires_at.
+
+	// Simulate a crashed process: leftover metadata written to the lock file
+	// but NO live process holds the OS advisory lock (the OS released it on
+	// the crash). The metadata is even already expired.
 	expired := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
 	data, err := json.MarshalIndent(ProjectLock{
-		Pid:       os.Getpid(),
+		Pid:       12345,
 		Command:   "add",
 		Agent:     "",
 		TaskID:    "",
@@ -150,12 +172,12 @@ func TestAcquireProjectLock_ExpiredLockRemovedAndReacquired(t *testing.T) {
 	if err := os.WriteFile(s.ProjectLockPath(), append(data, '\n'), 0600); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-	_ = h1
 
-	// The lock is already expired, so a second acquire should succeed.
+	// No live holder: acquisition succeeds immediately and reclaims the
+	// leftover metadata (logged as stale removed).
 	h2, err := AcquireProjectLock(s, ProjectLockOptions{Command: "claim", TTL: time.Minute})
 	if err != nil {
-		t.Fatalf("acquire over expired lock failed: %v", err)
+		t.Fatalf("acquire over stale leftover failed: %v", err)
 	}
 	defer h2.Release()
 
@@ -176,6 +198,29 @@ func TestAcquireProjectLock_ExpiredLockRemovedAndReacquired(t *testing.T) {
 	}
 }
 
+func TestAcquireProjectLock_LiveHolderNeverStolenEvenWhenExpired(t *testing.T) {
+	s := setupProjectLockStore(t)
+
+	// A live holder with short TTL metadata: the OS advisory lock is the
+	// source of truth, so the metadata expiry must NOT let a second process
+	// steal the lock.
+	h1, err := AcquireProjectLock(s, ProjectLockOptions{Command: "add", TTL: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	defer h1.Release()
+
+	// Wait past the recorded expiry, then try to acquire: must conflict.
+	time.Sleep(80 * time.Millisecond)
+	_, err = AcquireProjectLock(s, ProjectLockOptions{Command: "claim", TTL: time.Minute})
+	if err == nil {
+		t.Fatal("expected a conflict: live OS lock cannot be stolen even when metadata is expired")
+	}
+	if !IsProjectLockConflict(err) {
+		t.Errorf("expected ProjectLockConflict, got: %v", err)
+	}
+}
+
 func TestAcquireProjectLock_DefaultTTL(t *testing.T) {
 	s := setupProjectLockStore(t)
 
@@ -193,8 +238,11 @@ func TestAcquireProjectLock_DefaultTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invalid expires_at: %v", err)
 	}
-	// Default TTL is 2 minutes; allow small clock slack.
-	if d := time.Until(expires); d < 2*time.Minute-time.Second || d > 2*time.Minute+time.Second {
+	// Default TTL is 2 minutes. The measured remainder can only shrink from
+	// wall-clock time elapsed between the metadata write and this read, so
+	// allow generous lower slack (busy CI machines) but keep the upper bound
+	// tight - it must never exceed the 2m default.
+	if d := time.Until(expires); d < 2*time.Minute-5*time.Second || d > 2*time.Minute+time.Second {
 		t.Errorf("expected ~2m TTL, got %v", d)
 	}
 }
@@ -361,46 +409,6 @@ func TestProjectLockPathInsideCtaskDir(t *testing.T) {
 	}
 	if filepath.Base(s.ProjectLockPath()) != ProjectLockFile {
 		t.Errorf("expected lock file named %s, got %q", ProjectLockFile, filepath.Base(s.ProjectLockPath()))
-	}
-}
-
-func TestRemoveWithRetry_RemovesExistingFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "lock.tmp")
-	if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	if err := removeWithRetry(path); err != nil {
-		t.Fatalf("removeWithRetry failed: %v", err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("file still exists after removeWithRetry: %v", err)
-	}
-}
-
-func TestRemoveWithRetry_MissingFileIsSuccess(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "does-not-exist.lock")
-
-	// A missing file must be treated as success (os.ErrNotExist is not an error).
-	if err := removeWithRetry(path); err != nil {
-		t.Fatalf("removeWithRetry on missing file should succeed, got: %v", err)
-	}
-}
-
-func TestRemoveWithRetry_ReturnsErrorWhenRemovalKeepsFailing(t *testing.T) {
-	// A non-empty directory cannot be removed with os.Remove: the error is not
-	// os.ErrNotExist and never resolves, so removeWithRetry must surface it
-	// instead of silently swallowing it.
-	dir := t.TempDir()
-	nonEmpty := filepath.Join(dir, "blocked")
-	if err := os.MkdirAll(filepath.Join(nonEmpty, "child"), 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-
-	if err := removeWithRetry(nonEmpty); err == nil {
-		t.Fatal("expected removeWithRetry to return an error for a non-empty directory")
 	}
 }
 

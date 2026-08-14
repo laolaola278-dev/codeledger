@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codeledger/codeledger/internal/model"
+	"github.com/codeledger/codeledger/internal/store"
 )
 
 func TestExecute_TextErrorRenderedOnce(t *testing.T) {
@@ -135,8 +137,19 @@ func TestExecute_LockConflictExitCode(t *testing.T) {
 	env := newTestEnv(t)
 	env.initProject()
 
-	// Future-expiring project lock owned by another process.
-	writeProjectLockFixture(t, env.Dir)
+	// A live holder: the OS advisory lock is the source of truth in P1, so a
+	// real flock held by another open file description is required to produce
+	// a conflict (leftover metadata alone is reclaimed, not a conflict).
+	s := env.store()
+	handle, err := store.AcquireProjectLock(s, store.ProjectLockOptions{
+		Command: "other-agent",
+		Agent:   "other-agent",
+		TTL:     5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("AcquireProjectLock failed: %v", err)
+	}
+	defer handle.Release()
 
 	code := Execute(context.Background(), env.deps(), []string{"add", "Task A"})
 	if code != 3 {

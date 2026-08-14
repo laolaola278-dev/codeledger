@@ -29,8 +29,9 @@ func requireInit(s *store.Store) error {
 }
 
 // classifyErr wraps a service/store error with a stable machine kind.
-// Task-not-found errors become NOT_FOUND; pre-typed errors pass through
-// unchanged so their kind (e.g. LOCK_CONFLICT) is never masked.
+// Pre-typed errors pass through unchanged; known service sentinels are mapped
+// to their stable kind with errors.Is (never by string matching); everything
+// else becomes OPERATION_FAILED.
 func classifyErr(prefix string, err error) error {
 	if err == nil {
 		return nil
@@ -39,8 +40,23 @@ func classifyErr(prefix string, err error) error {
 	if errors.As(err, &ce) {
 		return err
 	}
-	if errors.Is(err, service.ErrTaskNotFound) {
+	switch {
+	case errors.Is(err, service.ErrTaskNotFound):
 		return clierr.Wrap(clierr.KindNotFound, err, "%s", prefix)
+	case errors.Is(err, service.ErrInvalidTTL):
+		// An unparseable/non-positive --ttl is a caller validation failure,
+		// classified like invalid priority: VALIDATION_ERROR, exit 2.
+		return clierr.Wrap(clierr.KindValidation, err, "%s", prefix)
+	case errors.Is(err, service.ErrLeaseConflict):
+		return clierr.Wrap(clierr.KindLeaseConflict, err, "%s", prefix)
+	case errors.Is(err, service.ErrLeaseExpired):
+		return clierr.Wrap(clierr.KindLeaseExpired, err, "%s", prefix)
+	case errors.Is(err, service.ErrForceRequired):
+		return clierr.Wrap(clierr.KindForceRequired, err, "%s", prefix)
+	case errors.Is(err, service.ErrLeaseNotFound):
+		return clierr.Wrap(clierr.KindLeaseNotFound, err, "%s", prefix)
+	case errors.Is(err, service.ErrLegacyState):
+		return clierr.Wrap(clierr.KindLegacyState, err, "%s", prefix)
 	}
 	return clierr.Wrap(clierr.KindOperation, err, "%s", prefix)
 }

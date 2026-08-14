@@ -32,7 +32,7 @@ Flags:
 			return err
 		}
 
-		result, err := service.NextTask(s, o.role)
+		result, err := service.NextTask(s, o.role, deps.Clock)
 		if err != nil {
 			return classifyErr("next failed", err)
 		}

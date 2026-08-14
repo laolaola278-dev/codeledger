@@ -5,6 +5,9 @@ import (
 	"os"
 
 	"github.com/codeledger/codeledger/internal/clierr"
+	"github.com/codeledger/codeledger/internal/clock"
+	"github.com/codeledger/codeledger/internal/lease"
+	"github.com/codeledger/codeledger/internal/model"
 	"github.com/spf13/cobra"
 )
 
@@ -22,6 +25,19 @@ type Dependencies struct {
 	// WorkDir is the directory commands operate in. Empty means the process
 	// current directory.
 	WorkDir string
+	// Clock is the injectable time source used for lease/lock expiry logic.
+	// Zero value defaults to the real clock.
+	Clock clock.Clock
+	// NewID generates lease IDs for claims and the project mutation lock.
+	// Zero value defaults to cryptographic random IDs.
+	NewID lease.IDGen
+	// LockAudit overrides the audit sink for the project mutation lock's own
+	// lifecycle events (project.lock_acquired / project.lock_released /
+	// project.lock_conflict / project.lock_stale_removed). It is nil in
+	// production, which means Store.AppendEvent. Tests inject a deterministic
+	// failure here; it is an instance-level seam (a fresh value per
+	// execution), never a global hook or an environment variable.
+	LockAudit func(evt model.Event) error
 }
 
 // NewDependencies returns the default dependencies bound to the process
@@ -32,6 +48,22 @@ func NewDependencies() Dependencies {
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
 	}
+}
+
+// clockOf returns the injected clock, falling back to the real clock.
+func clockOf(deps Dependencies) clock.Clock {
+	if deps.Clock != nil {
+		return deps.Clock
+	}
+	return clock.RealClock{}
+}
+
+// idGenOf returns the injected lease-ID generator, falling back to random IDs.
+func idGenOf(deps Dependencies) lease.IDGen {
+	if deps.NewID != nil {
+		return deps.NewID
+	}
+	return lease.RandomID
 }
 
 // newCommand creates a command wired with the process contract: Cobra's own
@@ -65,6 +97,11 @@ Coding agents use it to resume work across sessions without losing context.`)
 	root.SetIn(deps.Stdin)
 	root.SetOut(deps.Stdout)
 	root.SetErr(deps.Stderr)
+
+	// P1: normalize injectable dependencies so every command sees a non-nil
+	// clock and ID generator even when tests construct Dependencies directly.
+	deps.Clock = clockOf(deps)
+	deps.NewID = idGenOf(deps)
 
 	root.AddCommand(
 		newAddCmd(deps),
