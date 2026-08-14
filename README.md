@@ -88,8 +88,8 @@ ctask report
 | `ctask list` | List all tasks (filter with `--status`) |
 | `ctask next` | Show the next suggested task to work on |
 | `ctask claim <task-id>` | Claim a task: create a lease and mark in_progress (--agent required, --role, --ttl) |
-| `ctask release <task-id>` | Release a task's lease back to pending (--agent, --lease-id; --force --reason to break another's lease) |
-| `ctask heartbeat <task-id>` | Renew a task's lease by the full lease duration (--agent, --lease-id) |
+| `ctask release <task-id>` | Release a task's lease back to pending (--agent, --lease-id; --force --reason --agent to break another's lease) |
+| `ctask heartbeat <task-id>` | Renew a task's lease by the full lease duration (--agent + --lease-id required) |
 | `ctask start <task-id>` | Mark a task as in progress (no lock) |
 | `ctask done <task-id>` | Mark a task as completed (--files, --auto-files, --capture-diff, --test, --result, --note, --agent, --force, --reason) |
 | `ctask block <task-id> <reason>` | Mark a task as blocked |
@@ -142,11 +142,11 @@ Every mutating command (`add`, `claim`, `release`, `heartbeat`, `done`, `block`,
 
 `ctask claim <task-id> --agent <name>` creates a **lease**: a unique `lease_id`, a recorded `lease_duration`, and an `expires_at` of now + TTL. `ctask heartbeat` is a **true renewal** - it extends `expires_at` by the full recorded duration, not just stamps it. Lease contract:
 
-- Only the lease **owner** (matching `--agent`, and `--lease-id` when given) can renew or release an active lease.
-- Breaking another agent's lease requires `--force` with an explicit `--reason` (audited via a `task.lease_broken` event).
-- An **expired** lease is stale and can be cleaned by anyone without force.
-- **Legacy locks** (pre-P1 format: no `lease_id` / `lease_duration`, or unparseable fields) are **fail-closed**: they block claims and cannot be renewed or released without `--force --reason`. `ctask check` surfaces them as a warning.
-- `ctask done` on a leased task requires the owner (or `--force --reason`); a successful completion auto-releases the lease.
+- Once a lock record exists, `--agent` AND `--lease-id` are **both mandatory** fencing credentials. Missing one is `LEASE_REQUIRED` (exit 3); a non-matching agent or lease-id is `LEASE_MISMATCH` (exit 3).
+- An **expired** lease is fail-closed (`LEASE_EXPIRED`, exit 3): ordinary operations (including release) never clean it. The only ordinary replacement path is a same-task re-claim; every other task's entry is preserved.
+- Breaking/taking over a lease requires `--force` with a non-empty `--reason` AND `--agent` actor (audited via a `task.lease_broken` event).
+- **Legacy locks** (pre-P1 format: no `lease_id` / `lease_duration`, or unparseable fields) are **fail-closed** (`LEGACY_LEASE_REQUIRES_TAKEOVER`, exit 3): they block claims and every ordinary operation, and can only be taken over with `--force --reason --agent`. `ctask check` surfaces them as a warning.
+- `ctask done` on a leased task requires the exact owner (`--agent` + `--lease-id`, or `--force --reason --agent`); a successful completion auto-releases only the verified target lease.
 
 ### Stable exit codes
 
@@ -155,9 +155,9 @@ Errors are classified by typed machine codes (never by string matching) and map 
 | Exit | Meaning | Machine codes |
 |------|---------|---------------|
 | 0 | success | - |
-| 1 | business / check / legacy-state failure | `NOT_INITIALIZED`, `NOT_FOUND`, `CHECK_FAILED`, `OPERATION_FAILED`, `LEGACY_STATE`, `INTERNAL_ERROR` |
-| 2 | usage / validation failure | `USAGE_ERROR`, `VALIDATION_ERROR`, `FORCE_REQUIRED`, invalid `--ttl` |
-| 3 | contention / precondition | `LOCK_CONFLICT`, `LEASE_CONFLICT`, `LEASE_EXPIRED` |
+| 1 | business / check / not-found failure | `NOT_INITIALIZED`, `NOT_FOUND`, `LEASE_NOT_FOUND`, `CHECK_FAILED`, `OPERATION_FAILED`, `INTERNAL_ERROR` |
+| 2 | usage / validation failure | `USAGE_ERROR`, `VALIDATION_ERROR`, `FORCE_REASON_REQUIRED`, `FORCE_AGENT_REQUIRED`, invalid `--ttl` |
+| 3 | contention / precondition | `LOCK_CONFLICT`, `LEASE_CONFLICT`, `LEASE_REQUIRED`, `LEASE_MISMATCH`, `LEASE_EXPIRED`, `LEGACY_LEASE_REQUIRES_TAKEOVER` |
 
 Commands with `--json` output a single JSON document; on failure that document is an error envelope with `ok=false`, `error.code`, and `error.message` on stdout. Text-mode errors are printed exactly once on stderr.
 

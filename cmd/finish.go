@@ -23,6 +23,9 @@ type finishOptions struct {
 	result      string
 	note        string
 	agent       string
+	leaseID     string
+	force       bool
+	reason      string
 	autoFiles   bool
 	captureDiff bool
 	skipReport  bool
@@ -89,6 +92,9 @@ Flags:
 
 	cmd.Flags().StringVar(&o.task, "task", "", "Task ID to complete before finishing")
 	cmd.Flags().StringVar(&o.agent, "agent", "", "Agent name performing the finish")
+	cmd.Flags().StringVar(&o.leaseID, "lease-id", "", "Lease ID (required to complete a leased task)")
+	cmd.Flags().BoolVar(&o.force, "force", false, "Break the lease to complete the task (requires --reason and --agent)")
+	cmd.Flags().StringVar(&o.reason, "reason", "", "Human-readable reason required with --force")
 	cmd.Flags().StringVar(&o.files, "files", "", "Comma-separated modified files (with --task)")
 	cmd.Flags().StringVar(&o.test, "test", "", "Test command that was run (with --task)")
 	cmd.Flags().StringVar(&o.result, "result", "", "Test result: passed, failed, skipped, unknown (with --task)")
@@ -167,6 +173,9 @@ func runFinish(cmd *cobra.Command, deps Dependencies, s *store.Store, o *finishO
 				AutoFiles:   o.autoFiles,
 				CaptureDiff: o.captureDiff,
 				Agent:       o.agent,
+				LeaseID:     o.leaseID,
+				Force:       o.force,
+				Reason:      o.reason,
 			}
 			if err := service.CompleteTask(s, deps.Clock, o.task, opts); err != nil {
 				if o.json {

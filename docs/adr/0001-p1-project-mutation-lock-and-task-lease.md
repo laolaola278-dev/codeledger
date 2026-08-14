@@ -59,17 +59,28 @@ Two coordination problems remained unsolved:
   - `expires_at = now + duration` and `heartbeat_at = acquired_at`.
 - `heartbeat` is a **true renewal**: `expires_at` is extended by the full
   recorded `lease_duration` (now + duration), never merely stamped.
-- Strict owner/lease validation for renew/release/done:
-  - `--agent` must match the lease owner; `--lease-id`, when given, must match;
-  - breaking a lease requires `--force` with an explicit `--reason`
-    (`FORCE_REQUIRED` otherwise), and is audited via `task.lease_broken`;
-  - an expired lease is stale and cleanable by anyone without force;
-  - `done` on a leased task auto-releases the lease on success.
+- Strict owner/lease validation for heartbeat/release/start/done/block/note:
+  - once a lock record exists, `--agent` AND `--lease-id` are BOTH mandatory
+    fencing credentials: a missing credential is `LEASE_REQUIRED` (exit 3),
+    and a non-matching agent or lease-id is `LEASE_MISMATCH` (exit 3);
+  - an ordinary (non-force) operation on an **expired** lease is fail-closed
+    (`LEASE_EXPIRED`, exit 3): the entry is preserved and never silently
+    cleaned. The only ordinary replacement path is a same-task re-claim;
+  - an ordinary (non-force) operation on a **legacy** record is fail-closed
+    (`LEGACY_LEASE_REQUIRES_TAKEOVER`, exit 3);
+  - breaking/taking over a lease requires `--force` with an explicit
+    `--reason` AND a non-empty `--agent` actor (`FORCE_REASON_REQUIRED` /
+    `FORCE_AGENT_REQUIRED` otherwise, exit 2), audited via `task.lease_broken`;
+  - `done` on a leased task auto-releases only the just-verified target lease
+    on success.
+- No global expiry sweep: `claim` replaces only the target task's entry; every
+  other task's active, expired, or legacy entry is preserved untouched.
 - Legacy (pre-P1) lock entries - missing `lease_id`/`lease_duration` or
-  unparseable fields - are **fail-closed** (`LEGACY_STATE`): they block
-  claims, cannot be renewed or released without `--force --reason`, and are
-  surfaced as a warning by `ctask check`. This is the migration path: no
-  silent upgrade of untrusted state.
+  unparseable fields - are **fail-closed** (`LEGACY_LEASE_REQUIRES_TAKEOVER`,
+  exit 3): they block claims and every ordinary operation, and can only be
+  taken over with `--force --reason --agent`. They are surfaced as a warning
+  by `ctask check`. This is the migration path: no silent upgrade of untrusted
+  state.
 
 ### 3. Time and identity are injectable
 
@@ -82,13 +93,18 @@ race-prone timing windows. The project lock accepts the same injection via
 ### 4. Exit-code and machine-code extension
 
 New typed machine codes were added to `internal/clierr`:
-`LEASE_CONFLICT`, `LEASE_EXPIRED`, `FORCE_REQUIRED`, `LEASE_NOT_FOUND`,
-`LEGACY_STATE`. Mapping (typed errors + `errors.Is` only, never strings):
+`LEASE_CONFLICT` (claim contention), `LEASE_REQUIRED`, `LEASE_MISMATCH`,
+`LEASE_EXPIRED`, `LEASE_NOT_FOUND`, `LEGACY_LEASE_REQUIRES_TAKEOVER`,
+`FORCE_REASON_REQUIRED`, `FORCE_AGENT_REQUIRED`. Mapping (typed errors +
+`errors.Is` only, never strings):
 
-- exit 3: `LOCK_CONFLICT`, `LEASE_CONFLICT`, `LEASE_EXPIRED` (contention);
-- exit 2: `USAGE_ERROR`, `VALIDATION_ERROR`, `FORCE_REQUIRED`, invalid
-  `--ttl` (caller/validation errors);
-- exit 1: `LEGACY_STATE` and everything else (business/check failures).
+- exit 3 (contention/precondition): `LOCK_CONFLICT`, `LEASE_CONFLICT`,
+  `LEASE_REQUIRED`, `LEASE_MISMATCH`, `LEASE_EXPIRED`,
+  `LEGACY_LEASE_REQUIRES_TAKEOVER`;
+- exit 2 (validation): `USAGE_ERROR`, `VALIDATION_ERROR`,
+  `FORCE_REASON_REQUIRED`, `FORCE_AGENT_REQUIRED`, invalid `--ttl`;
+- exit 1 (business/check): `LEASE_NOT_FOUND`, `NOT_FOUND`, `CHECK_FAILED`,
+  `OPERATION_FAILED`, and other untyped business failures.
 
 The single renderer and single-JSON-document contract from P0 are preserved.
 

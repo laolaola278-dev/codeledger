@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/codeledger/codeledger/internal/clierr"
+	"github.com/codeledger/codeledger/internal/lease"
 	"github.com/codeledger/codeledger/internal/service"
 	"github.com/spf13/cobra"
 )
@@ -11,6 +13,15 @@ import (
 type heartbeatOptions struct {
 	agent   string
 	leaseID string
+	json    bool
+}
+
+// heartbeatJSONOutput is the single JSON document emitted by `heartbeat --json`.
+type heartbeatJSONOutput struct {
+	TaskID    string `json:"task_id"`
+	Agent     string `json:"agent"`
+	LeaseID   string `json:"lease_id"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 func newHeartbeatCmd(deps Dependencies) *cobra.Command {
@@ -20,15 +31,16 @@ func newHeartbeatCmd(deps Dependencies) *cobra.Command {
 expiry is extended by the full recorded lease duration, not just stamped.
 
 Lease contract:
-  - only the lease owner may renew (--agent matching the lease owner,
-    --lease-id matching the lease when provided);
+  - both --agent and --lease-id must match the lease exactly (fencing token
+    is mandatory, not optional);
   - an expired lease cannot be renewed (LEASE_EXPIRED): claim the task again;
-  - legacy locks (pre-lease format) cannot be renewed: release them with
-    --force --reason and claim again.
+  - legacy locks (pre-lease format) cannot be renewed (fail-closed): release
+    them with --force --reason --agent and claim again.
 
 Flags:
   --agent      Agent name renewing the lease
-  --lease-id   Lease ID to renew (optional; verified against the lease)`)
+  --lease-id   Lease ID to renew (required when a lease exists)
+  --json       Output the renewal as a single JSON document`)
 	cmd.Args = exactArgs(1)
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if o.agent == "" {
@@ -42,10 +54,28 @@ Flags:
 
 		taskID := args[0]
 		return withProjectLock(deps, s, "heartbeat", o.agent, taskID, func() error {
-			lock, err := service.HeartbeatTask(s, deps.Clock, taskID, o.agent, o.leaseID)
+			lock, err := service.HeartbeatTask(s, deps.Clock, taskID, lease.Auth{
+				Agent:   o.agent,
+				LeaseID: o.leaseID,
+			})
 			if err != nil {
 				return classifyErr("heartbeat failed", err)
 			}
+
+			if o.json {
+				data, merr := json.MarshalIndent(heartbeatJSONOutput{
+					TaskID:    taskID,
+					Agent:     o.agent,
+					LeaseID:   lock.LeaseID,
+					ExpiresAt: lock.ExpiresAt,
+				}, "", "  ")
+				if merr != nil {
+					return clierr.Wrap(clierr.KindOperation, merr, "failed to marshal JSON")
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+
 			fmt.Fprintf(cmd.OutOrStdout(), "Heartbeat sent for task %s.\n", taskID)
 			fmt.Fprintf(cmd.OutOrStdout(), "Lease %s renewed: expires %s\n", lock.LeaseID, lock.ExpiresAt)
 			return nil
@@ -53,6 +83,7 @@ Flags:
 	}
 
 	cmd.Flags().StringVar(&o.agent, "agent", "", "Agent name renewing the lease")
-	cmd.Flags().StringVar(&o.leaseID, "lease-id", "", "Lease ID to renew (verified against the lease)")
+	cmd.Flags().StringVar(&o.leaseID, "lease-id", "", "Lease ID to renew (required when a lease exists)")
+	cmd.Flags().BoolVar(&o.json, "json", false, "Output the renewal as a single JSON document")
 	return cmd
 }

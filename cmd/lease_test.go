@@ -42,9 +42,9 @@ func TestLeaseCLI_ClaimHeartbeatReleaseFlow(t *testing.T) {
 	}
 
 	// Advance 10 minutes, then heartbeat: the expiry must move forward by the
-	// full 30m (true renewal).
+	// full 30m (true renewal). The exact lease-id is required.
 	env.Clock = clock.FixedClock{T: time.Date(2026, 1, 2, 3, 14, 5, 0, time.UTC)}
-	code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1"})
+	code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1", "--lease-id", "lease-cli-0001"})
 	if code != 0 {
 		t.Fatalf("heartbeat failed with exit %d\nstderr: %s", code, env.Err.String())
 	}
@@ -54,12 +54,12 @@ func TestLeaseCLI_ClaimHeartbeatReleaseFlow(t *testing.T) {
 
 	// The lease is still valid 35 minutes after the original acquisition.
 	env.Clock = clock.FixedClock{T: time.Date(2026, 1, 2, 3, 39, 5, 0, time.UTC)}
-	if code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1"}); code != 0 {
+	if code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1", "--lease-id", "lease-cli-0001"}); code != 0 {
 		t.Errorf("expected lease still valid after renewal, exit %d\nstderr: %s", code, env.Err.String())
 	}
 
-	// Release by the owner.
-	if code := Execute(context.Background(), env.deps(), []string{"release", "TASK-001", "--agent", "agent1"}); code != 0 {
+	// Release by the owner (exact agent + lease-id).
+	if code := Execute(context.Background(), env.deps(), []string{"release", "TASK-001", "--agent", "agent1", "--lease-id", "lease-cli-0001"}); code != 0 {
 		t.Fatalf("release failed with exit %d\nstderr: %s", code, env.Err.String())
 	}
 }
@@ -82,9 +82,6 @@ func TestExecute_LeaseExitCodes(t *testing.T) {
 		if code != 3 {
 			t.Errorf("expected exit 3 for lease conflict, got %d\nstderr: %s", code, env.Err.String())
 		}
-		if !strings.Contains(env.Err.String(), "lease conflict") {
-			t.Errorf("expected lease conflict message, got %q", env.Err.String())
-		}
 	})
 
 	t.Run("release force without reason", func(t *testing.T) {
@@ -99,15 +96,40 @@ func TestExecute_LeaseExitCodes(t *testing.T) {
 		}
 	})
 
+	t.Run("release force without actor", func(t *testing.T) {
+		env := leaseEnv(t, t0)
+		if _, err := env.run("add", "Task"); err != nil {
+			t.Fatalf("add failed: %v", err)
+		}
+		cliClaim(env, "TASK-001", "agent1")
+		code := Execute(context.Background(), env.deps(), []string{"release", "TASK-001", "--force", "--reason", "cleanup"})
+		if code != 2 {
+			t.Errorf("expected exit 2 for --force without --agent, got %d\nstderr: %s", code, env.Err.String())
+		}
+	})
+
 	t.Run("release non-owner without force", func(t *testing.T) {
 		env := leaseEnv(t, t0)
 		if _, err := env.run("add", "Task"); err != nil {
 			t.Fatalf("add failed: %v", err)
 		}
 		cliClaim(env, "TASK-001", "agent1")
+		// Missing lease-id on an active lease: LEASE_REQUIRED (exit 3).
 		code := Execute(context.Background(), env.deps(), []string{"release", "TASK-001", "--agent", "agent2"})
 		if code != 3 {
-			t.Errorf("expected exit 3 for non-owner release, got %d\nstderr: %s", code, env.Err.String())
+			t.Errorf("expected exit 3 for missing lease-id release, got %d\nstderr: %s", code, env.Err.String())
+		}
+	})
+
+	t.Run("heartbeat missing lease-id", func(t *testing.T) {
+		env := leaseEnv(t, t0)
+		if _, err := env.run("add", "Task"); err != nil {
+			t.Fatalf("add failed: %v", err)
+		}
+		cliClaim(env, "TASK-001", "agent1")
+		code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1"})
+		if code != 3 {
+			t.Errorf("expected exit 3 for missing lease-id heartbeat, got %d\nstderr: %s", code, env.Err.String())
 		}
 	})
 
@@ -117,7 +139,7 @@ func TestExecute_LeaseExitCodes(t *testing.T) {
 			t.Fatalf("add failed: %v", err)
 		}
 		cliClaim(env, "TASK-001", "agent1")
-		code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent2"})
+		code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent2", "--lease-id", "lease-cli-0001"})
 		if code != 3 {
 			t.Errorf("expected exit 3 for heartbeat by non-owner, got %d\nstderr: %s", code, env.Err.String())
 		}
@@ -129,15 +151,14 @@ func TestExecute_LeaseExitCodes(t *testing.T) {
 			t.Fatalf("add failed: %v", err)
 		}
 		cliClaim(env, "TASK-001", "agent1")
-		// 31 minutes later the 30m lease is expired.
 		env.Clock = clock.FixedClock{T: t0.Add(31 * time.Minute)}
-		code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1"})
+		code := Execute(context.Background(), env.deps(), []string{"heartbeat", "TASK-001", "--agent", "agent1", "--lease-id", "lease-cli-0001"})
 		if code != 3 {
 			t.Errorf("expected exit 3 for expired lease, got %d\nstderr: %s", code, env.Err.String())
 		}
 	})
 
-	t.Run("done without owner", func(t *testing.T) {
+	t.Run("done without credentials", func(t *testing.T) {
 		env := leaseEnv(t, t0)
 		if _, err := env.run("add", "Task"); err != nil {
 			t.Fatalf("add failed: %v", err)
@@ -145,43 +166,40 @@ func TestExecute_LeaseExitCodes(t *testing.T) {
 		cliClaim(env, "TASK-001", "agent1")
 		code := Execute(context.Background(), env.deps(), []string{"done", "TASK-001", "--result", "passed"})
 		if code != 3 {
-			t.Errorf("expected exit 3 for done without owner, got %d\nstderr: %s", code, env.Err.String())
+			t.Errorf("expected exit 3 for done without credentials, got %d\nstderr: %s", code, env.Err.String())
 		}
-		// With the owner it succeeds.
-		code = Execute(context.Background(), env.deps(), []string{"done", "TASK-001", "--result", "passed", "--agent", "agent1"})
+		// With the exact owner it succeeds.
+		code = Execute(context.Background(), env.deps(), []string{"done", "TASK-001", "--result", "passed", "--agent", "agent1", "--lease-id", "lease-cli-0001"})
 		if code != 0 {
 			t.Errorf("expected exit 0 for owner done, got %d\nstderr: %s", code, env.Err.String())
 		}
 	})
 
-	t.Run("claim over legacy lock fail-closed", func(t *testing.T) {
+	t.Run("claim over legacy lock fail-closed exit 3", func(t *testing.T) {
 		env := leaseEnv(t, t0)
 		if _, err := env.run("add", "Task"); err != nil {
 			t.Fatalf("add failed: %v", err)
 		}
 		writeLegacyLock(t, env, "TASK-001", "old-agent")
 		code := cliClaim(env, "TASK-001", "agent2")
-		if code != 1 {
-			t.Errorf("expected exit 1 for legacy claim, got %d\nstderr: %s", code, env.Err.String())
-		}
-		if !strings.Contains(env.Err.String(), "legacy") {
-			t.Errorf("expected legacy message, got %q", env.Err.String())
+		if code != 3 {
+			t.Errorf("expected exit 3 for legacy claim, got %d\nstderr: %s", code, env.Err.String())
 		}
 	})
 
-	t.Run("release legacy lock requires force", func(t *testing.T) {
+	t.Run("release legacy lock requires force takeover exit 3", func(t *testing.T) {
 		env := leaseEnv(t, t0)
 		if _, err := env.run("add", "Task"); err != nil {
 			t.Fatalf("add failed: %v", err)
 		}
 		writeLegacyLock(t, env, "TASK-001", "old-agent")
 		code := Execute(context.Background(), env.deps(), []string{"release", "TASK-001", "--agent", "old-agent"})
-		if code != 1 {
-			t.Errorf("expected exit 1 for legacy release without force, got %d\nstderr: %s", code, env.Err.String())
+		if code != 3 {
+			t.Errorf("expected exit 3 for legacy release without force, got %d\nstderr: %s", code, env.Err.String())
 		}
 		code = Execute(context.Background(), env.deps(), []string{"release", "TASK-001", "--agent", "old-agent", "--force", "--reason", "migrate"})
 		if code != 0 {
-			t.Errorf("expected exit 0 for legacy release with force+reason, got %d\nstderr: %s", code, env.Err.String())
+			t.Errorf("expected exit 0 for legacy release with force+reason+agent, got %d\nstderr: %s", code, env.Err.String())
 		}
 	})
 
@@ -207,7 +225,7 @@ func TestExecute_LeaseExitCodes(t *testing.T) {
 		}
 	})
 
-	t.Run("release force with reason breaks lease", func(t *testing.T) {
+	t.Run("release force with reason and actor breaks lease", func(t *testing.T) {
 		env := leaseEnv(t, t0)
 		if _, err := env.run("add", "Task"); err != nil {
 			t.Fatalf("add failed: %v", err)
@@ -231,11 +249,11 @@ func TestExecute_LeaseErrorKinds(t *testing.T) {
 	}
 	cliClaim(env, "TASK-001", "agent1")
 
-	_, err := env.run("heartbeat", "TASK-001", "--agent", "agent2")
+	_, err := env.run("heartbeat", "TASK-001", "--agent", "agent2", "--lease-id", "lease-cli-0001")
 	if err == nil {
 		t.Fatal("expected heartbeat error")
 	}
-	if got := kindOf(t, err); got != "LEASE_CONFLICT" {
-		t.Errorf("expected LEASE_CONFLICT kind, got %q", got)
+	if got := kindOf(t, err); got != "LEASE_MISMATCH" {
+		t.Errorf("expected LEASE_MISMATCH kind, got %q", got)
 	}
 }

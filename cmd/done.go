@@ -13,6 +13,7 @@ type doneOptions struct {
 	result      string
 	note        string
 	agent       string
+	leaseID     string
 	force       bool
 	reason      string
 	autoFiles   bool
@@ -24,9 +25,10 @@ func newDoneCmd(deps Dependencies) *cobra.Command {
 	cmd := newCommand("done <task-id>", "Mark a task as completed",
 		`Mark a task as done with optional metadata.
 
-Lease contract: completing a task with an active lease requires --agent
-matching the lease owner. To complete a task leased by someone else (or in a
-legacy pre-lease state), pass --force with an explicit --reason.
+Lease contract: completing a task with a lock record requires --agent AND
+--lease-id matching the lease exactly. To complete a task leased by someone
+else (or in a legacy/expired pre-lease state), pass --force with an explicit
+--reason and a non-empty --agent actor.
 
 Flags:
   --files          Comma-separated list of modified files
@@ -34,7 +36,8 @@ Flags:
   --result         Test result: passed, failed, skipped, unknown
   --note           Completion note
   --agent          Agent completing the task (owner of the lease)
-  --force          Break the lease to complete the task (requires --reason)
+  --lease-id       Lease ID (required when a lease exists)
+  --force          Break the lease to complete the task (requires --reason and --agent)
   --reason         Human-readable reason required with --force
   --auto-files     Automatically detect changed files from Git (default: false)
   --capture-diff   Capture full Git diff in evidence file (default: false)`)
@@ -55,6 +58,7 @@ Flags:
 				AutoFiles:   o.autoFiles,
 				CaptureDiff: o.captureDiff,
 				Agent:       o.agent,
+				LeaseID:     o.leaseID,
 				Force:       o.force,
 				Reason:      o.reason,
 			}
@@ -71,7 +75,8 @@ Flags:
 	cmd.Flags().StringVar(&o.result, "result", "", "Test result: passed, failed, skipped, unknown")
 	cmd.Flags().StringVar(&o.note, "note", "", "Completion note")
 	cmd.Flags().StringVar(&o.agent, "agent", "", "Agent completing the task (owner of the lease)")
-	cmd.Flags().BoolVar(&o.force, "force", false, "Break the lease to complete the task (requires --reason)")
+	cmd.Flags().StringVar(&o.leaseID, "lease-id", "", "Lease ID (required when a lease exists)")
+	cmd.Flags().BoolVar(&o.force, "force", false, "Break the lease to complete the task (requires --reason and --agent)")
 	cmd.Flags().StringVar(&o.reason, "reason", "", "Human-readable reason required with --force")
 	cmd.Flags().BoolVar(&o.autoFiles, "auto-files", false, "Automatically detect changed files from Git")
 	cmd.Flags().BoolVar(&o.captureDiff, "capture-diff", false, "Capture full Git diff in evidence file")

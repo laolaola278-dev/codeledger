@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/codeledger/codeledger/internal/clock"
+	"github.com/codeledger/codeledger/internal/lease"
 	"github.com/codeledger/codeledger/internal/model"
 	"github.com/codeledger/codeledger/internal/store"
 	"github.com/codeledger/codeledger/internal/util"
@@ -81,7 +82,21 @@ func findTaskByID(tl *model.TaskList, id string) (int, *model.Task, error) {
 }
 
 // StartTask sets a task's status to in_progress.
-func StartTask(s *store.Store, taskID string) error {
+//
+// Lease contract: when a lock record exists for the task (active, expired, or
+// legacy), start requires the exact owner (--agent + --lease-id) or an
+// explicit --force --reason --agent override. With no record, start keeps its
+// original no-lease compatibility behavior (no flags required).
+func StartTask(s *store.Store, clk clock.Clock, taskID string, auth lease.Auth) error {
+	locks, err := s.ReadLocks()
+	if err != nil {
+		return err
+	}
+	res, err := gateLease(locks, clk.Now(), taskID, auth, false)
+	if err != nil {
+		return err
+	}
+
 	tl, err := s.ReadTasks()
 	if err != nil {
 		return err
@@ -108,14 +123,23 @@ func StartTask(s *store.Store, taskID string) error {
 	}
 
 	task.Status = model.StatusInProgress
-	task.UpdatedAt = util.NowRFC3339()
+	task.UpdatedAt = clk.Now().UTC().Format(time.RFC3339)
 	tl.Tasks[idx] = *task
 
 	if err := s.WriteTasks(tl); err != nil {
 		return err
 	}
 
+	// Audit a forced override without touching the lease itself (start never
+	// removes or modifies the existing lease).
+	if res.forced {
+		return recordForcedOverride(s, taskID, task.Title, auth, res.entry)
+	}
+
 	evt := model.NewEvent(model.EventTaskStarted, taskID, task.Title, "")
+	if auth.Agent != "" {
+		evt.Agent = auth.Agent
+	}
 	return s.AppendEvent(evt)
 }
 
@@ -127,12 +151,13 @@ type CompleteOptions struct {
 	Note        string
 	AutoFiles   bool
 	CaptureDiff bool
-	// Agent is the completing agent. When the task has an active lease, the
-	// lease owner must match Agent (strict owner validation), or Force must
-	// be set with an explicit Reason.
-	Agent  string
-	Force  bool
-	Reason string
+	// Agent is the completing agent. When the task has a lock record, Agent
+	// and LeaseID must both match the record exactly, or Force must be set
+	// with an explicit Reason.
+	Agent   string
+	LeaseID string
+	Force   bool
+	Reason  string
 }
 
 // CompleteTask marks a task as done with optional metadata.
@@ -141,17 +166,32 @@ type CompleteOptions struct {
 // If captureDiff is true, the full Git diff is saved to a separate .diff
 // evidence file and the path is added to Task.Evidence.
 //
-// Lease contract: completion of a task with an active lease requires the
-// lease owner (opts.Agent), or --force --reason to break the lease. Legacy
-// locks are fail-closed: they require --force --reason too. Expired leases
-// are stale and are cleaned without ownership proof.
+// Lease contract: completion of a task with a lock record requires the exact
+// owner (opts.Agent + opts.LeaseID), or --force --reason --agent to override.
+// Legacy and expired records are fail-closed (exit 3); they are never
+// silently cleaned by an ordinary completion. A successful completion removes
+// only the just-verified target lease.
 func CompleteTask(s *store.Store, clk clock.Clock, taskID string, opts CompleteOptions) error {
 	// Validate the lease BEFORE doing any completion work so a blocked
 	// completion never leaves partial state (evidence, status, events).
-	hasLease, broken, err := completionLeaseGate(s, clk, taskID, opts.Agent, opts.Force, opts.Reason)
+	locks, err := s.ReadLocks()
 	if err != nil {
 		return err
 	}
+	nowT := clk.Now()
+	res, err := gateLease(locks, nowT, taskID, lease.Auth{
+		Agent:   opts.Agent,
+		LeaseID: opts.LeaseID,
+		Force:   opts.Force,
+		Reason:  opts.Reason,
+	}, false)
+	if err != nil {
+		return err
+	}
+	// Immutable snapshot of the prior record BEFORE the completion removes
+	// the lease, so the forced-override audit carries the true previous
+	// owner/lease/state (classified under the same now as the gate).
+	prior := snapshotLock(res.entry, nowT)
 
 	tl, err := s.ReadTasks()
 	if err != nil {
@@ -171,7 +211,7 @@ func CompleteTask(s *store.Store, clk clock.Clock, taskID string, opts CompleteO
 		return fmt.Errorf("invalid test result: %s (must be passed, failed, skipped, or unknown)", opts.Result)
 	}
 
-	now := clk.Now().UTC().Format(time.RFC3339)
+	now := nowT.UTC().Format(time.RFC3339)
 	task.Status = model.StatusDone
 	task.UpdatedAt = now
 	task.CompletedAt = now
@@ -271,15 +311,16 @@ func CompleteTask(s *store.Store, clk clock.Clock, taskID string, opts CompleteO
 		return err
 	}
 
-	// Auto-release lease if the task was claimed.
-	if hasLease {
+	// Auto-release the lease if the task had a record. The gate already
+	// verified the exact lease (owner path) or authorized the override (force
+	// path), so removing the single target entry removes exactly the verified
+	// lease and never touches another task.
+	if res.entry != nil {
 		if err := removeLease(s, taskID); err != nil {
 			return err
 		}
-		if broken {
-			brokenEvt := model.NewEvent(model.EventTaskLeaseBroken, taskID, task.Title, opts.Reason)
-			brokenEvt.Agent = opts.Agent
-			return s.AppendEvent(brokenEvt)
+		if res.forced {
+			return recordForcedOverrideAudit(s, taskID, task.Title, lease.Auth{Agent: opts.Agent, Reason: opts.Reason}, prior, "lease removed")
 		}
 		releasedEvt := model.NewEvent(model.EventLockReleasedOnDone, taskID, "", "")
 		if err := s.AppendEvent(releasedEvt); err != nil {
@@ -290,73 +331,41 @@ func CompleteTask(s *store.Store, clk clock.Clock, taskID string, opts CompleteO
 	return nil
 }
 
-// completionLeaseGate validates the lease on a task before completion.
-//
-// Return values:
-//   - hasLease: the task currently has a lock entry that must be removed;
-//   - broken: the lease was force-broken (requires a task.lease_broken event);
-//   - err: the completion is blocked (LEASE_CONFLICT / LEASE_EXPIRED /
-//     LEGACY_STATE / FORCE_REQUIRED).
-func completionLeaseGate(s *store.Store, clk clock.Clock, taskID, agent string, force bool, reason string) (hasLease, broken bool, err error) {
-	if force && reason == "" {
-		return false, false, fmt.Errorf("%w: --force requires --reason", ErrForceRequired)
-	}
-
-	locks, err := s.ReadLocks()
-	if err != nil {
-		return false, false, err
-	}
-
-	now := clk.Now()
-	for i := range locks.Locks {
-		l := &locks.Locks[i]
-		if l.TaskID != taskID {
-			continue
-		}
-		switch {
-		case l.Legacy():
-			if !force {
-				return true, false, fmt.Errorf("%w: task %s has a legacy lock from %s; pass --force --reason to complete it",
-					ErrLegacyState, taskID, l.Agent)
-			}
-			return true, true, nil
-		case l.ExpiredAt(now):
-			// Stale lease: clean it on completion, no ownership proof needed.
-			return true, false, nil
-		case agent == "":
-			return true, false, fmt.Errorf("%w: task %s is leased by %s; pass --agent %s (or --force --reason)",
-				ErrLeaseConflict, taskID, l.Agent, l.Agent)
-		case l.Agent != agent:
-			if !force {
-				return true, false, fmt.Errorf("%w: task %s is leased by %s, not %s (use --force --reason)",
-					ErrLeaseConflict, taskID, l.Agent, agent)
-			}
-			return true, true, nil
-		default:
-			return true, false, nil
-		}
-	}
-	return false, false, nil
-}
-
-// removeLease removes any lock entry for the given task.
+// removeLease removes only the lock entry for the given task, preserving all
+// other entries (active, expired, or legacy) untouched.
 func removeLease(s *store.Store, taskID string) error {
 	locks, err := s.ReadLocks()
 	if err != nil {
 		return err
 	}
-	var active []model.Lock
-	for _, l := range locks.Locks {
-		if l.TaskID != taskID {
-			active = append(active, l)
-		}
-	}
-	locks.Locks = active
+	removeTaskLock(locks, taskID)
 	return s.WriteLocks(locks)
 }
 
+// recordForcedOverride appends a task.lease_broken audit event recording the
+// actor, reason, and the previous owner/lease/state. It is used by mutations
+// that honor a --force override without removing the existing lease (start /
+// block / note): the fence is overridden for this one mutation but the lease
+// itself is retained so other agents remain fenced out.
+func recordForcedOverride(s *store.Store, taskID, title string, auth lease.Auth, entry *model.Lock) error {
+	return recordForcedOverrideAudit(s, taskID, title, auth, snapshotLock(entry, time.Now()), "lease retained")
+}
+
 // BlockTask sets a task's status to blocked with a reason.
-func BlockTask(s *store.Store, taskID, reason string) error {
+//
+// Lease contract: identical to StartTask - a lock record requires exact owner
+// credentials or --force --reason --agent; no record keeps the compatibility
+// path. Blocking never removes the existing lease.
+func BlockTask(s *store.Store, clk clock.Clock, taskID, reason string, auth lease.Auth) error {
+	locks, err := s.ReadLocks()
+	if err != nil {
+		return err
+	}
+	res, err := gateLease(locks, clk.Now(), taskID, auth, false)
+	if err != nil {
+		return err
+	}
+
 	tl, err := s.ReadTasks()
 	if err != nil {
 		return err
@@ -373,19 +382,39 @@ func BlockTask(s *store.Store, taskID, reason string) error {
 
 	task.Status = model.StatusBlocked
 	task.BlockedReason = reason
-	task.UpdatedAt = util.NowRFC3339()
+	task.UpdatedAt = clk.Now().UTC().Format(time.RFC3339)
 	tl.Tasks[idx] = *task
 
 	if err := s.WriteTasks(tl); err != nil {
 		return err
 	}
 
+	if res.forced {
+		return recordForcedOverride(s, taskID, task.Title, auth, res.entry)
+	}
+
 	evt := model.NewEvent(model.EventTaskBlocked, taskID, task.Title, reason)
+	if auth.Agent != "" {
+		evt.Agent = auth.Agent
+	}
 	return s.AppendEvent(evt)
 }
 
 // NoteTask appends a note to a task without changing its status.
-func NoteTask(s *store.Store, taskID, note string) error {
+//
+// Lease contract: identical to StartTask - a lock record requires exact owner
+// credentials or --force --reason --agent; no record keeps the compatibility
+// path. Noting never removes the existing lease.
+func NoteTask(s *store.Store, clk clock.Clock, taskID, note string, auth lease.Auth) error {
+	locks, err := s.ReadLocks()
+	if err != nil {
+		return err
+	}
+	res, err := gateLease(locks, clk.Now(), taskID, auth, false)
+	if err != nil {
+		return err
+	}
+
 	tl, err := s.ReadTasks()
 	if err != nil {
 		return err
@@ -401,14 +430,21 @@ func NoteTask(s *store.Store, taskID, note string) error {
 	} else {
 		task.Notes = note
 	}
-	task.UpdatedAt = util.NowRFC3339()
+	task.UpdatedAt = clk.Now().UTC().Format(time.RFC3339)
 	tl.Tasks[idx] = *task
 
 	if err := s.WriteTasks(tl); err != nil {
 		return err
 	}
 
+	if res.forced {
+		return recordForcedOverride(s, taskID, task.Title, auth, res.entry)
+	}
+
 	evt := model.NewEvent(model.EventTaskNoted, taskID, task.Title, note)
+	if auth.Agent != "" {
+		evt.Agent = auth.Agent
+	}
 	return s.AppendEvent(evt)
 }
 

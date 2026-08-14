@@ -49,14 +49,20 @@ func classifyErr(prefix string, err error) error {
 		return clierr.Wrap(clierr.KindValidation, err, "%s", prefix)
 	case errors.Is(err, service.ErrLeaseConflict):
 		return clierr.Wrap(clierr.KindLeaseConflict, err, "%s", prefix)
+	case errors.Is(err, service.ErrLeaseRequired):
+		return clierr.Wrap(clierr.KindLeaseRequired, err, "%s", prefix)
+	case errors.Is(err, service.ErrLeaseMismatch):
+		return clierr.Wrap(clierr.KindLeaseMismatch, err, "%s", prefix)
 	case errors.Is(err, service.ErrLeaseExpired):
 		return clierr.Wrap(clierr.KindLeaseExpired, err, "%s", prefix)
-	case errors.Is(err, service.ErrForceRequired):
-		return clierr.Wrap(clierr.KindForceRequired, err, "%s", prefix)
 	case errors.Is(err, service.ErrLeaseNotFound):
 		return clierr.Wrap(clierr.KindLeaseNotFound, err, "%s", prefix)
-	case errors.Is(err, service.ErrLegacyState):
-		return clierr.Wrap(clierr.KindLegacyState, err, "%s", prefix)
+	case errors.Is(err, service.ErrLegacyLease):
+		return clierr.Wrap(clierr.KindLegacyLeaseRequiresTakeover, err, "%s", prefix)
+	case errors.Is(err, service.ErrForceReasonRequired):
+		return clierr.Wrap(clierr.KindForceReasonRequired, err, "%s", prefix)
+	case errors.Is(err, service.ErrForceAgentRequired):
+		return clierr.Wrap(clierr.KindForceAgentRequired, err, "%s", prefix)
 	}
 	return clierr.Wrap(clierr.KindOperation, err, "%s", prefix)
 }

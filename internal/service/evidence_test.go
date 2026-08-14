@@ -16,15 +16,17 @@ func TestCompleteTaskAutoReleasesLockAndRecordsEvidence(t *testing.T) {
 	s, _ := setupTestStore(t)
 	task := addTestTask(t, s, "Done lock task", model.PriorityHigh, nil)
 
-	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "agent1", "developer", "120m"); err != nil {
+	lock, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "agent1"}, "developer", "120m")
+	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 	if err := CompleteTask(s, clock.RealClock{}, task.ID, CompleteOptions{
-		Files:  "main.go",
-		Test:   "go test ./...",
-		Result: model.TestResultPassed,
-		Note:   "completed",
-		Agent:  "agent1",
+		Files:   "main.go",
+		Test:    "go test ./...",
+		Result:  model.TestResultPassed,
+		Note:    "completed",
+		Agent:   "agent1",
+		LeaseID: lock.LeaseID,
 	}); err != nil {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/codeledger/codeledger/internal/lease"
 	"github.com/codeledger/codeledger/internal/service"
 	"github.com/spf13/cobra"
 )
@@ -21,17 +22,19 @@ func newReleaseCmd(deps Dependencies) *cobra.Command {
 set back to pending, making it available for other agents to claim.
 
 Lease contract:
-  - an active lease can only be released by its owner: pass --agent matching
-    the lease owner (and --lease-id matching the lease when provided);
-  - to break another agent's lease, pass --force with an explicit --reason;
+  - an active lease can only be released by its exact owner: both --agent and
+    --lease-id must match the lease (the fencing token is mandatory);
+  - to break another agent's lease, pass --force with an explicit --reason and
+    a non-empty --agent actor;
   - legacy locks (pre-lease format) are fail-closed: release them with
-    --force --reason as well;
-  - an expired lease is stale and can be cleaned by anyone without force.
+    --force --reason --agent as well;
+  - an expired lease is fail-closed too (LEASE_EXPIRED): ordinary release
+    never cleans it - re-claim the task or force takeover instead.
 
 Flags:
   --agent      Agent name (owner of the lease being released)
-  --lease-id   Lease ID to release (optional; verified against the lease)
-  --force      Break the lease even when not the owner (requires --reason)
+  --lease-id   Lease ID to release (required when a lease exists)
+  --force      Break the lease even when not the owner (requires --reason and --agent)
   --reason     Human-readable reason required with --force`)
 	cmd.Args = exactArgs(1)
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
@@ -42,7 +45,12 @@ Flags:
 
 		taskID := args[0]
 		return withProjectLock(deps, s, "release", o.agent, taskID, func() error {
-			if err := service.ReleaseTask(s, deps.Clock, taskID, o.agent, o.leaseID, o.force, o.reason); err != nil {
+			if err := service.ReleaseTask(s, deps.Clock, taskID, lease.Auth{
+				Agent:   o.agent,
+				LeaseID: o.leaseID,
+				Force:   o.force,
+				Reason:  o.reason,
+			}); err != nil {
 				return classifyErr("release failed", err)
 			}
 			if o.agent != "" {
@@ -55,8 +63,8 @@ Flags:
 	}
 
 	cmd.Flags().StringVar(&o.agent, "agent", "", "Agent name (owner of the lease being released)")
-	cmd.Flags().StringVar(&o.leaseID, "lease-id", "", "Lease ID to release (verified against the lease)")
-	cmd.Flags().BoolVar(&o.force, "force", false, "Break the lease even when not the owner (requires --reason)")
+	cmd.Flags().StringVar(&o.leaseID, "lease-id", "", "Lease ID to release (required when a lease exists)")
+	cmd.Flags().BoolVar(&o.force, "force", false, "Break the lease even when not the owner (requires --reason and --agent)")
 	cmd.Flags().StringVar(&o.reason, "reason", "", "Human-readable reason required with --force")
 	return cmd
 }

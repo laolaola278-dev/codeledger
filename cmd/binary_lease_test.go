@@ -29,6 +29,26 @@ func addBinTask(t *testing.T, dir string) string {
 	return "TASK-001"
 }
 
+// readBinLeaseID reads the recorded lease_id for taskID from locks.yaml.
+func readBinLeaseID(t *testing.T, dir, taskID string) string {
+	t.Helper()
+	s := store.NewStore(dir)
+	locks, err := s.ReadLocks()
+	if err != nil {
+		t.Fatalf("ReadLocks failed: %v", err)
+	}
+	for _, l := range locks.Locks {
+		if l.TaskID == taskID {
+			if l.LeaseID == "" {
+				t.Fatalf("no lease_id recorded for %s", taskID)
+			}
+			return l.LeaseID
+		}
+	}
+	t.Fatalf("no lock recorded for %s", taskID)
+	return ""
+}
+
 // TestBinary_ClaimHeartbeatReleaseFlow exercises the full lease lifecycle
 // through the real process boundary.
 func TestBinary_ClaimHeartbeatReleaseFlow(t *testing.T) {
@@ -68,8 +88,10 @@ func TestBinary_ClaimHeartbeatReleaseFlow(t *testing.T) {
 		t.Fatal("expected lease for TASK-001 in locks.yaml")
 	}
 
-	// Heartbeat by the owner renews.
-	r = runBin(t, dir, "heartbeat", "TASK-001", "--agent", "codex")
+	leaseID := readBinLeaseID(t, dir, "TASK-001")
+
+	// Heartbeat by the owner (exact agent + lease-id) renews.
+	r = runBin(t, dir, "heartbeat", "TASK-001", "--agent", "codex", "--lease-id", leaseID)
 	if r.code != 0 {
 		t.Fatalf("heartbeat failed: exit %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
@@ -77,8 +99,8 @@ func TestBinary_ClaimHeartbeatReleaseFlow(t *testing.T) {
 		t.Errorf("expected renewal output, got: %q", r.stdout)
 	}
 
-	// Release by the owner.
-	r = runBin(t, dir, "release", "TASK-001", "--agent", "codex")
+	// Release by the owner (exact agent + lease-id).
+	r = runBin(t, dir, "release", "TASK-001", "--agent", "codex", "--lease-id", leaseID)
 	if r.code != 0 {
 		t.Fatalf("release failed: exit %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
@@ -109,7 +131,7 @@ func TestBinary_ClaimConflict_Exit3(t *testing.T) {
 }
 
 // TestBinary_ReleaseForceWithoutReason_Exit2 verifies --force requires an
-// explicit --reason (FORCE_REQUIRED -> exit 2).
+// explicit --reason (FORCE_REASON_REQUIRED -> exit 2).
 func TestBinary_ReleaseForceWithoutReason_Exit2(t *testing.T) {
 	dir := initBinDir(t)
 	addBinTask(t, dir)
@@ -121,7 +143,7 @@ func TestBinary_ReleaseForceWithoutReason_Exit2(t *testing.T) {
 	if r.code != 2 {
 		t.Errorf("expected exit 2, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
-	if !strings.Contains(r.stderr, "--force requires --reason") {
+	if !strings.Contains(r.stderr, "--force requires a non-empty --reason") {
 		t.Errorf("expected force-reason message on stderr, got: %q", r.stderr)
 	}
 	// With a reason the same command succeeds.
@@ -145,8 +167,9 @@ func TestBinary_DoneLeaseGate(t *testing.T) {
 	if r.code != 3 {
 		t.Errorf("expected exit 3 for done without owner, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
-	// Owner completes successfully.
-	r = runBin(t, dir, "done", "TASK-001", "--result", "passed", "--agent", "agent1")
+	leaseID := readBinLeaseID(t, dir, "TASK-001")
+	// Owner with exact lease-id completes successfully.
+	r = runBin(t, dir, "done", "TASK-001", "--result", "passed", "--agent", "agent1", "--lease-id", leaseID)
 	if r.code != 0 {
 		t.Errorf("expected exit 0 for owner done, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
@@ -184,10 +207,10 @@ func TestBinary_LegacyLockFailClosed(t *testing.T) {
 		t.Fatalf("WriteLocks failed: %v", err)
 	}
 
-	// Claim is blocked fail-closed (LEGACY_STATE -> exit 1).
+	// Claim is blocked fail-closed (LEGACY_LEASE_REQUIRES_TAKEOVER -> exit 3).
 	r := runBin(t, dir, "claim", "TASK-001", "--agent", "new-agent", "--ttl", "30m")
-	if r.code != 1 {
-		t.Errorf("expected exit 1 for claim over legacy lock, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
+	if r.code != 3 {
+		t.Errorf("expected exit 3 for claim over legacy lock, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
 	if !strings.Contains(r.stderr, "legacy") {
 		t.Errorf("expected legacy message on stderr, got: %q", r.stderr)
@@ -195,11 +218,11 @@ func TestBinary_LegacyLockFailClosed(t *testing.T) {
 
 	// Plain release is blocked too.
 	r = runBin(t, dir, "release", "TASK-001", "--agent", "old-agent")
-	if r.code != 1 {
-		t.Errorf("expected exit 1 for legacy release without force, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
+	if r.code != 3 {
+		t.Errorf("expected exit 3 for legacy release without force, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
 	}
 
-	// --force --reason clears it.
+	// --force --reason --agent clears it.
 	r = runBin(t, dir, "release", "TASK-001", "--agent", "old-agent", "--force", "--reason", "migrating legacy lock")
 	if r.code != 0 {
 		t.Errorf("expected exit 0 for legacy force release, got %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)

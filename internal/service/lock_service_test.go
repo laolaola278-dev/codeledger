@@ -129,7 +129,7 @@ func TestClaimTask_SetsInProgress(t *testing.T) {
 
 	task := addTestTask(t, s, "Claimable task", model.PriorityHigh, nil)
 
-	lock, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m")
+	lock, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "test-agent"}, "developer", "120m")
 	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
@@ -170,11 +170,12 @@ func TestReleaseTask_ResetsToPending(t *testing.T) {
 
 	task := addTestTask(t, s, "Releasable task", model.PriorityHigh, nil)
 
-	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m"); err != nil {
+	lock, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "test-agent"}, "developer", "120m")
+	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
-	if err := ReleaseTask(s, clock.RealClock{}, task.ID, "test-agent", "", false, ""); err != nil {
+	if err := ReleaseTask(s, clock.RealClock{}, task.ID, lease.Auth{Agent: "test-agent", LeaseID: lock.LeaseID}); err != nil {
 		t.Fatalf("ReleaseTask failed: %v", err)
 	}
 
@@ -199,22 +200,25 @@ func TestReleaseTask_ResetsToPending(t *testing.T) {
 	}
 }
 
-// TestClaimTask_ExpiredLockDoesNotBlock verifies that an expired lock does
-// not prevent claiming a task.
+// TestClaimTask_ExpiredLockDoesNotBlock verifies that an expired NEW-format
+// lock does not prevent same-task re-claiming (the entry is replaced with a
+// fresh lease).
 func TestClaimTask_ExpiredLockDoesNotBlock(t *testing.T) {
 	s, _ := setupTestStore(t)
 
 	task := addTestTask(t, s, "Expired lock task", model.PriorityHigh, nil)
 
-	// Add an expired lock
-	past := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
+	// Add an expired, well-formed (non-legacy) lock.
+	now := time.Now().UTC()
 	expiredLock := model.Lock{
-		TaskID:      task.ID,
-		Agent:       "old-agent",
-		Role:        "developer",
-		AcquiredAt:  time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
-		ExpiresAt:   past,
-		HeartbeatAt: time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
+		TaskID:        task.ID,
+		Agent:         "old-agent",
+		Role:          "developer",
+		LeaseID:       "lease-old",
+		LeaseDuration: "120m",
+		AcquiredAt:    now.Add(-3 * time.Hour).Format(time.RFC3339),
+		ExpiresAt:     now.Add(-2 * time.Hour).Format(time.RFC3339),
+		HeartbeatAt:   now.Add(-3 * time.Hour).Format(time.RFC3339),
 	}
 	locks, err := s.ReadLocks()
 	if err != nil {
@@ -226,7 +230,7 @@ func TestClaimTask_ExpiredLockDoesNotBlock(t *testing.T) {
 	}
 
 	// Claim should succeed despite the expired lock
-	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "new-agent", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "new-agent"}, "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask should succeed with expired lock, but got: %v", err)
 	}
 
@@ -247,6 +251,29 @@ func TestClaimTask_ExpiredLockDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestClaimTask_ExpiredLegacyLockFailClosed verifies that a legacy entry that
+// has ALSO expired still blocks a claim fail-closed (legacy precedence over
+// expired): it must be taken over with --force --reason --agent, never
+// silently reclaimed.
+func TestClaimTask_ExpiredLegacyLockFailClosed(t *testing.T) {
+	s, _ := setupTestStore(t)
+	task := addTestTask(t, s, "Expired legacy task", model.PriorityHigh, nil)
+
+	now := time.Now().UTC()
+	expiredLegacy := model.Lock{
+		TaskID:     task.ID,
+		Agent:      "old-agent",
+		Role:       "developer",
+		AcquiredAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+		ExpiresAt:  now.Add(-2 * time.Hour).Format(time.RFC3339),
+	}
+	writeRawLock(t, s, expiredLegacy)
+
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "new-agent"}, "developer", "120m"); !errors.Is(err, ErrLegacyLease) {
+		t.Fatalf("expected ErrLegacyLease for expired legacy claim, got: %v", err)
+	}
+}
+
 // TestClaimTask_AlreadyLocked verifies that claiming a task with an active
 // lease returns a lease conflict error.
 func TestClaimTask_AlreadyLocked(t *testing.T) {
@@ -255,12 +282,12 @@ func TestClaimTask_AlreadyLocked(t *testing.T) {
 	task := addTestTask(t, s, "Locked task", model.PriorityHigh, nil)
 
 	// First claim succeeds
-	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "agent1", "developer", "120m"); err != nil {
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "agent1"}, "developer", "120m"); err != nil {
 		t.Fatalf("first ClaimTask failed: %v", err)
 	}
 
 	// Second claim should fail
-	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "agent2", "developer", "120m")
+	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "agent2"}, "developer", "120m")
 	if err == nil {
 		t.Fatal("expected error when claiming an already locked task")
 	}
@@ -292,14 +319,15 @@ func TestHeartbeatTask(t *testing.T) {
 
 	task := addTestTask(t, s, "Heartbeat task", model.PriorityHigh, nil)
 
-	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m"); err != nil {
+	lock, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "test-agent"}, "developer", "120m")
+	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
 	// Small delay to ensure timestamp changes
 	time.Sleep(1100 * time.Millisecond)
 
-	if _, err := HeartbeatTask(s, clock.RealClock{}, task.ID, "test-agent", ""); err != nil {
+	if _, err := HeartbeatTask(s, clock.RealClock{}, task.ID, lease.Auth{Agent: "test-agent", LeaseID: lock.LeaseID}); err != nil {
 		t.Fatalf("HeartbeatTask failed: %v", err)
 	}
 
@@ -324,7 +352,7 @@ func TestReleaseTask_NoLock(t *testing.T) {
 
 	task := addTestTask(t, s, "No lock task", model.PriorityHigh, nil)
 
-	err := ReleaseTask(s, clock.RealClock{}, task.ID, "", "", false, "")
+	err := ReleaseTask(s, clock.RealClock{}, task.ID, lease.Auth{})
 	if err == nil {
 		t.Fatal("expected error when releasing a task with no lock")
 	}
@@ -342,7 +370,7 @@ func TestClaimTask_DoneTaskFails(t *testing.T) {
 		t.Fatalf("CompleteTask failed: %v", err)
 	}
 
-	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m")
+	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "test-agent"}, "developer", "120m")
 	if err == nil {
 		t.Fatal("expected error when claiming a done task")
 	}
@@ -353,11 +381,11 @@ func TestClaimTask_BlockedTaskFails(t *testing.T) {
 	s, _ := setupTestStore(t)
 
 	task := addTestTask(t, s, "Blocked task", model.PriorityHigh, nil)
-	if err := BlockTask(s, task.ID, "blocked reason"); err != nil {
+	if err := BlockTask(s, clock.RealClock{}, task.ID, "blocked reason", lease.Auth{}); err != nil {
 		t.Fatalf("BlockTask failed: %v", err)
 	}
 
-	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, "test-agent", "developer", "120m")
+	_, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, task.ID, lease.Auth{Agent: "test-agent"}, "developer", "120m")
 	if err == nil {
 		t.Fatal("expected error when claiming a blocked task")
 	}
@@ -413,23 +441,25 @@ func TestNextTask_DependsOnChain(t *testing.T) {
 	}
 }
 
-// TestExpiredLockCleanedOnClaim verifies that expired locks are cleaned
-// when a new claim is made.
-func TestExpiredLockCleanedOnClaim(t *testing.T) {
+// TestClaim_DoesNotCleanOtherTaskExpiredLock verifies that claiming one task
+// does NOT remove another task's expired lock entry (no global expiry sweep).
+func TestClaim_DoesNotCleanOtherTaskExpiredLock(t *testing.T) {
 	s, _ := setupTestStore(t)
 
 	taskA := addTestTask(t, s, "Task A", model.PriorityHigh, nil)
 	taskB := addTestTask(t, s, "Task B", model.PriorityMedium, nil)
 
-	// Add expired lock for Task B
-	past := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
+	// Add a well-formed (non-legacy) expired lock for Task B.
+	now := time.Now().UTC()
 	expiredLock := model.Lock{
-		TaskID:      taskB.ID,
-		Agent:       "old-agent",
-		Role:        "developer",
-		ExpiresAt:   past,
-		HeartbeatAt: past,
-		AcquiredAt:  time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
+		TaskID:        taskB.ID,
+		Agent:         "old-agent",
+		Role:          "developer",
+		LeaseID:       "lease-old-b",
+		LeaseDuration: "120m",
+		AcquiredAt:    now.Add(-3 * time.Hour).Format(time.RFC3339),
+		ExpiresAt:     now.Add(-2 * time.Hour).Format(time.RFC3339),
+		HeartbeatAt:   now.Add(-3 * time.Hour).Format(time.RFC3339),
 	}
 	locks, err := s.ReadLocks()
 	if err != nil {
@@ -440,20 +470,26 @@ func TestExpiredLockCleanedOnClaim(t *testing.T) {
 		t.Fatalf("WriteLocks failed: %v", err)
 	}
 
-	// Claim Task A (this should clean expired locks)
-	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, taskA.ID, "agent1", "developer", "120m"); err != nil {
+	// Claim Task A: this must NOT clean Task B's expired lock.
+	if _, err := ClaimTask(s, clock.RealClock{}, lease.RandomID, taskA.ID, lease.Auth{Agent: "agent1"}, "developer", "120m"); err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
 
-	// Verify expired lock was cleaned
 	locks, err = s.ReadLocks()
 	if err != nil {
 		t.Fatalf("ReadLocks failed: %v", err)
 	}
+	foundB := false
 	for _, l := range locks.Locks {
-		if l.Agent == "old-agent" {
-			t.Errorf("expired lock from old-agent should have been cleaned, but found lock for task %s", l.TaskID)
+		if l.TaskID == taskB.ID {
+			foundB = true
+			if l.Agent != "old-agent" || l.LeaseID != "lease-old-b" {
+				t.Errorf("task B expired entry was modified: %+v", l)
+			}
 		}
+	}
+	if !foundB {
+		t.Error("claiming task A removed task B's expired lock (forbidden global sweep)")
 	}
 }
 

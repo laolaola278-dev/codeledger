@@ -52,13 +52,14 @@ func TestCmd_Finish_WithTask(t *testing.T) {
 	if _, err := env.run("claim", "TASK-001", "--agent", "codex"); err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
+	leaseID := readBinLeaseID(t, env.Dir, "TASK-001")
 
 	// Write a file so --auto-files can detect it
 	if err := os.WriteFile(filepath.Join(env.Dir, "auth.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatalf("failed to write auth.go: %v", err)
 	}
 
-	out, err := env.run("finish", "--task", "TASK-001", "--agent", "codex",
+	out, err := env.run("finish", "--task", "TASK-001", "--agent", "codex", "--lease-id", leaseID,
 		"--files", "auth.go", "--test", "go test ./...", "--result", "passed",
 		"--note", "done")
 	if err != nil {

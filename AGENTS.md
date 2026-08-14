@@ -53,11 +53,11 @@ This document is for AI coding agents. Follow these instructions when working on
 CodeLedger serializes concurrent mutations with a real OS advisory project lock (`.ctask/.ctask.lock`, via `gofrs/flock`), and tracks task ownership with leases:
 
 - `ctask claim <TASK-ID> --agent <name>` creates a lease with a unique `lease_id` and a TTL (default `120m`, `--ttl` to override). The task is set to `in_progress`.
-- Keep a lease alive while working: `ctask heartbeat <TASK-ID> --agent <name>` renews it by the **full lease duration** (a true renewal).
-- When finished, release it: `ctask release <TASK-ID> --agent <name>`. `ctask done` also releases the lease automatically when you pass `--agent`.
-- Only the lease **owner** can renew or release an active lease. To break another agent's lease, pass `--force` with an explicit `--reason` (audited via a `task.lease_broken` event).
-- **Expired** leases are stale and can be cleaned by anyone without force.
-- **Legacy locks** (pre-lease format, no `lease_id`) are **fail-closed**: they block claims and require `--force --reason` to remove. Run `ctask locks` to inspect, and `ctask check` surfaces legacy locks as warnings.
+- Keep a lease alive while working: `ctask heartbeat <TASK-ID> --agent <name> --lease-id <id>` renews it by the **full lease duration** (a true renewal).
+- When finished, release it: `ctask release <TASK-ID> --agent <name> --lease-id <id>`. `ctask done` also releases the lease automatically when you pass `--agent` + `--lease-id`.
+- Once a lease exists, `--agent` AND `--lease-id` are both **required** fencing credentials. To break another agent's lease, pass `--force` with an explicit `--reason` and a non-empty `--agent` actor (audited via a `task.lease_broken` event).
+- **Expired** leases are fail-closed (`LEASE_EXPIRED`, exit 3): ordinary commands (including release) never clean them; re-claim the same task instead. Unrelated commands never sweep another task's expired entry.
+- **Legacy locks** (pre-lease format, no `lease_id`) are **fail-closed** (`LEGACY_LEASE_REQUIRES_TAKEOVER`, exit 3): they block claims and require `--force --reason --agent` to take over. Run `ctask locks` to inspect, and `ctask check` surfaces legacy locks as warnings.
 
 Concurrency contract: every mutating command (`add`, `claim`, `release`, `heartbeat`, `done`, `block`, `note`, `start`, `finish`, `evidence add`, `plan save`) holds the project lock for the duration of the mutation; a conflicting process fails fast with exit code 3 and a `LOCK_CONFLICT` message. Read-only commands (`status`, `next`, `locks`, `check`, `context`, `report`, ...) never take the project lock.
 
@@ -77,14 +77,14 @@ Following these rules ensures that:
 # Before work
 ctask context        # Read current state
 ctask status         # See what to do next
-ctask claim TASK-001 --agent codex # Lock and begin working
+ctask claim TASK-001 --agent codex # Lock and begin working (prints the lease-id)
 
 # During work
-ctask note TASK-001 "found something important"
-ctask heartbeat TASK-001 --agent codex   # renew the lease while working
+ctask note TASK-001 "found something important" --agent codex --lease-id <id>
+ctask heartbeat TASK-001 --agent codex --lease-id <id>   # renew the lease
 
 # After work
-ctask release TASK-001 --agent codex   # release the lease (done also releases it)
+ctask release TASK-001 --agent codex --lease-id <id>   # release the lease (done also releases it)
 ctask changed                 # List changed files
 ctask diff --stat              # Diffstat summary
 ctask done TASK-001 --files "..." --auto-files --capture-diff --test "..." --result passed --note "..."

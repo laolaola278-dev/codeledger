@@ -28,21 +28,38 @@ const (
 	KindOperation      Kind = "OPERATION_FAILED"
 	KindInternal       Kind = "INTERNAL_ERROR"
 
-	// P1 lease contract.
-	KindLeaseConflict Kind = "LEASE_CONFLICT" // lease held by another owner, or claim blocked by an active lease
-	KindLeaseExpired  Kind = "LEASE_EXPIRED"  // operation requires a valid lease but it has expired
-	KindForceRequired Kind = "FORCE_REQUIRED" // breaking a lease requires --force with an explicit --reason
+	// P1 lease contract. These are the stable machine codes for the task
+	// lease fencing protocol (see the P1 ADR). They are never derived from
+	// error strings.
+	KindLeaseConflict Kind = "LEASE_CONFLICT" // a new claim is blocked by an active lease (contention)
+	KindLeaseRequired Kind = "LEASE_REQUIRED" // a lock record exists but --agent or --lease-id is missing
+	KindLeaseMismatch Kind = "LEASE_MISMATCH" // --agent or --lease-id does not match the active lease
+	KindLeaseExpired  Kind = "LEASE_EXPIRED"  // an ordinary operation targets an expired lease
 	KindLeaseNotFound Kind = "LEASE_NOT_FOUND"
-	KindLegacyState   Kind = "LEGACY_STATE" // pre-lease lock format: fail-closed, explicit force+reason required
+
+	// KindLegacyLeaseRequiresTakeover is returned for every ordinary
+	// (non-force) operation that targets a pre-P1 legacy lock entry. Legacy
+	// state is fail-closed and classified as a contention/precondition error
+	// (exit 3), never a plain business failure.
+	KindLegacyLeaseRequiresTakeover Kind = "LEGACY_LEASE_REQUIRES_TAKEOVER"
+
+	// KindForceReasonRequired is returned when --force is used without a
+	// non-empty --reason (validation failure, exit 2).
+	KindForceReasonRequired Kind = "FORCE_REASON_REQUIRED"
+	// KindForceAgentRequired is returned when --force is used without a
+	// non-empty --agent actor (validation failure, exit 2).
+	KindForceAgentRequired Kind = "FORCE_AGENT_REQUIRED"
 )
 
 // Process exit codes. These are part of the public contract:
 //
 //	0 - success
-//	1 - business execution failure, check/strict failure, lease/legacy state failures
-//	2 - usage/validation failure, including --force without the required --reason
+//	1 - business execution failure, check/strict failure, lease-not-found
+//	2 - usage/validation failure, including --force without the required
+//	    --reason or --agent actor
 //	3 - contention/precondition: project mutation lock conflict, task lease
-//	    conflict, or an operation on an expired lease
+//	    conflict, missing/mismatched lease credentials, expired lease, or a
+//	    legacy lock requiring explicit takeover
 const (
 	ExitOK         = 0
 	ExitBusiness   = 1
@@ -107,9 +124,10 @@ func ExitCode(err error) int {
 		return ExitOK
 	}
 	switch KindOf(err) {
-	case KindUsage, KindValidation, KindForceRequired:
+	case KindUsage, KindValidation, KindForceReasonRequired, KindForceAgentRequired:
 		return ExitUsage
-	case KindLockConflict, KindLeaseConflict, KindLeaseExpired:
+	case KindLockConflict, KindLeaseConflict, KindLeaseRequired, KindLeaseMismatch,
+		KindLeaseExpired, KindLegacyLeaseRequiresTakeover:
 		return ExitContention
 	default:
 		return ExitBusiness
